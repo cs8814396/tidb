@@ -42,9 +42,15 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/metrics"
 )
 
 const defaultWriterSize = 16 * 1024
+
+var (
+	readPacketBytes  = metrics.PacketIOHistogram.WithLabelValues("read")
+	writePacketBytes = metrics.PacketIOHistogram.WithLabelValues("write")
+)
 
 // packetIO is a helper to read and write data in packet format.
 type packetIO struct {
@@ -108,6 +114,7 @@ func (p *packetIO) readPacket() ([]byte, error) {
 	}
 
 	if len(data) < mysql.MaxPayloadLen {
+		readPacketBytes.Observe(float64(len(data)))
 		return data, nil
 	}
 
@@ -125,12 +132,14 @@ func (p *packetIO) readPacket() ([]byte, error) {
 		}
 	}
 
+	readPacketBytes.Observe(float64(len(data)))
 	return data, nil
 }
 
 // writePacket writes data that already have header
 func (p *packetIO) writePacket(data []byte) error {
 	length := len(data) - 4
+	writePacketBytes.Observe(float64(len(data)))
 
 	for length >= mysql.MaxPayloadLen {
 		data[0] = 0xff
@@ -140,9 +149,9 @@ func (p *packetIO) writePacket(data []byte) error {
 		data[3] = p.sequence
 
 		if n, err := p.bufWriter.Write(data[:4+mysql.MaxPayloadLen]); err != nil {
-			return mysql.ErrBadConn
+			return errors.Trace(mysql.ErrBadConn)
 		} else if n != (4 + mysql.MaxPayloadLen) {
-			return mysql.ErrBadConn
+			return errors.Trace(mysql.ErrBadConn)
 		} else {
 			p.sequence++
 			length -= mysql.MaxPayloadLen
@@ -167,5 +176,9 @@ func (p *packetIO) writePacket(data []byte) error {
 }
 
 func (p *packetIO) flush() error {
-	return p.bufWriter.Flush()
+	err := p.bufWriter.Flush()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	return err
 }

@@ -25,11 +25,13 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 )
 
 var (
@@ -38,9 +40,6 @@ var (
 	workerCnt = flag.Int("C", 400, "concurrent num")
 	pdAddr    = flag.String("pd", "localhost:2379", "pd address:localhost:2379")
 	valueSize = flag.Int("V", 5, "value size in byte")
-	sslCA     = flag.String("cacert", "", "path of file that contains list of trusted SSL CAs.")
-	sslCert   = flag.String("cert", "", "path of file that contains X509 certificate in PEM format.")
-	sslKey    = flag.String("key", "", "path of file that contains X509 key in PEM format.")
 
 	txnCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -78,7 +77,7 @@ func Init() {
 	prometheus.MustRegister(txnCounter)
 	prometheus.MustRegister(txnRolledbackCounter)
 	prometheus.MustRegister(txnDurations)
-	http.Handle("/metrics", prometheus.Handler())
+	http.Handle("/metrics", promhttp.Handler())
 
 	go func() {
 		err1 := http.ListenAndServe(":9191", nil)
@@ -100,7 +99,7 @@ func batchRW(value []byte) {
 				k := base*i + j
 				txn, err := store.Begin()
 				if err != nil {
-					log.Fatal(err)
+					log.Fatal(err.Error())
 				}
 				key := fmt.Sprintf("key_%d", k)
 				err = txn.Set([]byte(key), value)
@@ -120,7 +119,7 @@ func batchRW(value []byte) {
 
 func main() {
 	flag.Parse()
-	log.SetLevel(log.ErrorLevel)
+	log.SetLevel(zap.ErrorLevel)
 	Init()
 
 	value := make([]byte, *valueSize)

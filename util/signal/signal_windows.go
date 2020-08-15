@@ -19,11 +19,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 // SetupSignalHandler setup signal handler for TiDB Server
-func SetupSignalHandler(shudownFunc func(bool)) {
+func SetupSignalHandler(shutdownFunc func(bool)) {
 	//todo deal with dump goroutine stack on windows
 	closeSignalChan := make(chan os.Signal, 1)
 	signal.Notify(closeSignalChan,
@@ -34,7 +35,7 @@ func SetupSignalHandler(shudownFunc func(bool)) {
 
 	go func() {
 		sig := <-closeSignalChan
-		log.Infof("Got signal [%s] to exit.", sig)
-		shudownFunc(sig == syscall.SIGQUIT)
+		logutil.BgLogger().Info("got signal to exit", zap.Stringer("signal", sig))
+		shutdownFunc(sig == syscall.SIGQUIT)
 	}()
 }

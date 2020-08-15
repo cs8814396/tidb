@@ -17,12 +17,13 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 )
 
-func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
+func (ts *ConnTestSuite) TestParseExecArgs(c *C) {
 	type args struct {
-		args        []interface{}
+		args        []types.Datum
 		boundParams [][]byte
 		nullBitmap  []byte
 		paramTypes  []byte
@@ -36,41 +37,41 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		// Tests for int overflow
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{1, 0},
 				[]byte{0xff},
 			},
 			nil,
-			int8(-1),
+			int64(-1),
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{2, 0},
 				[]byte{0xff, 0xff},
 			},
 			nil,
-			int16(-1),
+			int64(-1),
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{3, 0},
 				[]byte{0xff, 0xff, 0xff, 0xff},
 			},
 			nil,
-			int32(-1),
+			int64(-1),
 		},
 		// Tests for date/datetime/timestamp
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{12, 0},
@@ -81,7 +82,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{10, 0},
@@ -92,7 +93,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{7, 0},
@@ -103,7 +104,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{7, 0},
@@ -114,7 +115,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{7, 0},
@@ -126,7 +127,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		// Tests for time
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{11, 0},
@@ -137,7 +138,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{11, 0},
@@ -148,7 +149,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{11, 0},
@@ -160,7 +161,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		// For error test
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{7, 0},
@@ -171,7 +172,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{11, 0},
@@ -182,7 +183,7 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 		{
 			args{
-				make([]interface{}, 1),
+				make([]types.Datum, 1),
 				[][]byte{nil},
 				[]byte{0x0},
 				[]byte{11, 0},
@@ -193,13 +194,13 @@ func (ts ConnTestSuite) TestParseStmtArgs(c *C) {
 		},
 	}
 	for _, tt := range tests {
-		err := parseStmtArgs(tt.args.args, tt.args.boundParams, tt.args.nullBitmap, tt.args.paramTypes, tt.args.paramValues)
+		err := parseExecArgs(&stmtctx.StatementContext{}, tt.args.args, tt.args.boundParams, tt.args.nullBitmap, tt.args.paramTypes, tt.args.paramValues)
 		c.Assert(terror.ErrorEqual(err, tt.err), IsTrue, Commentf("err %v", err))
-		c.Assert(tt.args.args[0], Equals, tt.expect)
+		c.Assert(tt.args.args[0].GetValue(), Equals, tt.expect)
 	}
 }
 
-func (ts ConnTestSuite) TestParseStmtFetchCmd(c *C) {
+func (ts *ConnTestSuite) TestParseStmtFetchCmd(c *C) {
 	tests := []struct {
 		arg       []byte
 		stmtID    uint32
@@ -215,7 +216,7 @@ func (ts ConnTestSuite) TestParseStmtFetchCmd(c *C) {
 	}
 
 	for _, t := range tests {
-		stmtID, fetchSize, err := parseStmtFetchCmd([]byte(t.arg))
+		stmtID, fetchSize, err := parseStmtFetchCmd(t.arg)
 		c.Assert(stmtID, Equals, t.stmtID)
 		c.Assert(fetchSize, Equals, t.fetchSize)
 		c.Assert(err, Equals, t.err)

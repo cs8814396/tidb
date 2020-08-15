@@ -19,8 +19,9 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/statistics"
+	"github.com/pingcap/tidb/statistics/handle"
 	"github.com/pingcap/tidb/util/chunk"
 )
 
@@ -50,7 +51,7 @@ func (k loadStatsVarKeyType) String() string {
 const LoadStatsVarKey loadStatsVarKeyType = 0
 
 // Next implements the Executor Next interface.
-func (e *LoadStatsExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+func (e *LoadStatsExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	req.GrowAndReset(e.maxChunkSize)
 	if len(e.info.Path) == 0 {
 		return errors.New("Load Stats: file path is empty")
@@ -76,7 +77,7 @@ func (e *LoadStatsExec) Open(ctx context.Context) error {
 
 // Update updates the stats of the corresponding table according to the data.
 func (e *LoadStatsInfo) Update(data []byte) error {
-	jsonTbl := &statistics.JSONTable{}
+	jsonTbl := &handle.JSONTable{}
 	if err := json.Unmarshal(data, jsonTbl); err != nil {
 		return errors.Trace(err)
 	}
@@ -85,5 +86,5 @@ func (e *LoadStatsInfo) Update(data []byte) error {
 	if h == nil {
 		return errors.New("Load Stats: handle is nil")
 	}
-	return errors.Trace(h.LoadStatsFromJSON(GetInfoSchema(e.Ctx), jsonTbl))
+	return h.LoadStatsFromJSON(infoschema.GetInfoSchema(e.Ctx), jsonTbl)
 }

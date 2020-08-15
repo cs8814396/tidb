@@ -22,12 +22,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/store"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/logutil"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 var (
@@ -47,17 +48,12 @@ var (
 		"gc",
 		"select:0_10000:10",
 	}, "|"), "jobs to run")
-	sslCA   = flag.String("cacert", "", "path of file that contains list of trusted SSL CAs.")
-	sslCert = flag.String("cert", "", "path of file that contains X509 certificate in PEM format.")
-	sslKey  = flag.String("key", "", "path of file that contains X509 key in PEM format.")
 )
 
 func main() {
 	flag.Parse()
 	flag.PrintDefaults()
-	err := logutil.InitLogger(&logutil.LogConfig{
-		Level: *logLevel,
-	})
+	err := logutil.InitZapLogger(logutil.NewLogConfig(*logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
 	terror.MustNil(err)
 	err = store.Register("tikv", tikv.Driver{})
 	terror.MustNil(err)
@@ -113,16 +109,16 @@ func newBenchDB() *benchDB {
 func (ut *benchDB) mustExec(sql string) {
 	rss, err := ut.session.Execute(context.Background(), sql)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 	if len(rss) > 0 {
 		ctx := context.Background()
 		rs := rss[0]
-		req := rs.NewRecordBatch()
+		req := rs.NewChunk()
 		for {
 			err := rs.Next(ctx, req)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatal(err.Error())
 			}
 			if req.NumRows() == 0 {
 				break
@@ -142,7 +138,7 @@ func (ut *benchDB) mustParseWork(work string) (name string, spec string) {
 func (ut *benchDB) mustParseInt(s string) int {
 	i, err := strconv.Atoi(s)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 	return i
 }
@@ -150,13 +146,13 @@ func (ut *benchDB) mustParseInt(s string) int {
 func (ut *benchDB) mustParseRange(s string) (start, end int) {
 	strs := strings.Split(s, "_")
 	if len(strs) != 2 {
-		log.Fatal("invalid range " + s)
+		log.Fatal("parse range failed", zap.String("invalid range", s))
 	}
 	startStr, endStr := strs[0], strs[1]
 	start = ut.mustParseInt(startStr)
 	end = ut.mustParseInt(endStr)
 	if start < 0 || end < start {
-		log.Fatal("invalid range " + s)
+		log.Fatal("parse range failed", zap.String("invalid range", s))
 	}
 	return
 }

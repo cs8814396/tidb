@@ -18,14 +18,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/ddl/util"
 	"github.com/pingcap/tidb/sessionctx"
+	"go.etcd.io/etcd/clientv3"
 )
 
-var _ SchemaSyncer = &MockSchemaSyncer{}
+var _ util.SchemaSyncer = &MockSchemaSyncer{}
 
 const mockCheckVersInterval = 2 * time.Millisecond
 
@@ -37,7 +39,7 @@ type MockSchemaSyncer struct {
 }
 
 // NewMockSchemaSyncer creates a new mock SchemaSyncer.
-func NewMockSchemaSyncer() SchemaSyncer {
+func NewMockSchemaSyncer() util.SchemaSyncer {
 	return &MockSchemaSyncer{}
 }
 
@@ -78,9 +80,6 @@ func (s *MockSchemaSyncer) Restart(_ context.Context) error {
 	return nil
 }
 
-// RemoveSelfVersionPath implements SchemaSyncer.RemoveSelfVersionPath interface.
-func (s *MockSchemaSyncer) RemoveSelfVersionPath() error { return nil }
-
 // OwnerUpdateGlobalVersion implements SchemaSyncer.OwnerUpdateGlobalVersion interface.
 func (s *MockSchemaSyncer) OwnerUpdateGlobalVersion(ctx context.Context, version int64) error {
 	select {
@@ -106,12 +105,21 @@ func (s *MockSchemaSyncer) OwnerCheckAllVersions(ctx context.Context, latestVer 
 			return errors.Trace(ctx.Err())
 		case <-ticker.C:
 			ver := atomic.LoadInt64(&s.selfSchemaVersion)
-			if ver == latestVer {
+			if ver >= latestVer {
 				return nil
 			}
 		}
 	}
 }
+
+// NotifyCleanExpiredPaths implements SchemaSyncer.NotifyCleanExpiredPaths interface.
+func (s *MockSchemaSyncer) NotifyCleanExpiredPaths() bool { return true }
+
+// StartCleanWork implements SchemaSyncer.StartCleanWork interface.
+func (s *MockSchemaSyncer) StartCleanWork() {}
+
+// Close implements SchemaSyncer.Close interface.
+func (s *MockSchemaSyncer) Close() {}
 
 type mockDelRange struct {
 }
@@ -127,7 +135,7 @@ func (dr *mockDelRange) addDelRangeJob(job *model.Job) error {
 }
 
 // removeFromGCDeleteRange implements delRangeManager interface.
-func (dr *mockDelRange) removeFromGCDeleteRange(jobID, tableID int64) error {
+func (dr *mockDelRange) removeFromGCDeleteRange(jobID int64, tableIDs []int64) error {
 	return nil
 }
 
@@ -139,11 +147,12 @@ func (dr *mockDelRange) clear() {}
 
 // MockTableInfo mocks a table info by create table stmt ast and a specified table id.
 func MockTableInfo(ctx sessionctx.Context, stmt *ast.CreateTableStmt, tableID int64) (*model.TableInfo, error) {
-	cols, newConstraints, err := buildColumnsAndConstraints(ctx, stmt.Cols, stmt.Constraints, "", "")
+	chs, coll := charset.GetDefaultCharsetAndCollate()
+	cols, newConstraints, err := buildColumnsAndConstraints(ctx, stmt.Cols, stmt.Constraints, chs, coll)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	tbl, err := buildTableInfo(ctx, nil, stmt.Table.Name, cols, newConstraints)
+	tbl, err := buildTableInfo(ctx, stmt.Table.Name, cols, newConstraints, "", "")
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -151,10 +160,6 @@ func MockTableInfo(ctx sessionctx.Context, stmt *ast.CreateTableStmt, tableID in
 
 	// The specified charset will be handled in handleTableOptions
 	if err = handleTableOptions(stmt.Options, tbl); err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	if err = resolveDefaultTableCharsetAndCollation(tbl, ""); err != nil {
 		return nil, errors.Trace(err)
 	}
 

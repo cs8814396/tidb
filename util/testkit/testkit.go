@@ -11,6 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// +build !codes
+
 package testkit
 
 import (
@@ -18,12 +20,17 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync/atomic"
 
 	"github.com/pingcap/check"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/pingcap/tidb/util/testutil"
 )
@@ -122,29 +129,57 @@ func NewTestKitWithInit(c *check.C, store kv.Storage) *TestKit {
 
 var connectionID uint64
 
+// GetConnectionID get the connection ID for tk.Se
+func (tk *TestKit) GetConnectionID() {
+	if tk.Se != nil {
+		id := atomic.AddUint64(&connectionID, 1)
+		tk.Se.SetConnectionID(id)
+	}
+}
+
 // Exec executes a sql statement.
 func (tk *TestKit) Exec(sql string, args ...interface{}) (sqlexec.RecordSet, error) {
 	var err error
 	if tk.Se == nil {
 		tk.Se, err = session.CreateSession4Test(tk.store)
 		tk.c.Assert(err, check.IsNil)
-		id := atomic.AddUint64(&connectionID, 1)
-		tk.Se.SetConnectionID(id)
+		tk.GetConnectionID()
 	}
 	ctx := context.Background()
 	if len(args) == 0 {
-		var rss []sqlexec.RecordSet
-		rss, err = tk.Se.Execute(ctx, sql)
-		if err == nil && len(rss) > 0 {
-			return rss[0], nil
+		sc := tk.Se.GetSessionVars().StmtCtx
+		prevWarns := sc.GetWarnings()
+		stmts, err := tk.Se.Parse(ctx, sql)
+		if err != nil {
+			return nil, errors.Trace(err)
 		}
-		return nil, errors.Trace(err)
+		warns := sc.GetWarnings()
+		parserWarns := warns[len(prevWarns):]
+		var rs0 sqlexec.RecordSet
+		for i, stmt := range stmts {
+			rs, err := tk.Se.ExecuteStmt(ctx, stmt)
+			if i == 0 {
+				rs0 = rs
+			}
+			if err != nil {
+				tk.Se.GetSessionVars().StmtCtx.AppendError(err)
+				return nil, errors.Trace(err)
+			}
+		}
+		if len(parserWarns) > 0 {
+			tk.Se.GetSessionVars().StmtCtx.AppendWarnings(parserWarns)
+		}
+		return rs0, nil
 	}
 	stmtID, _, _, err := tk.Se.PrepareStmt(sql)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	rs, err := tk.Se.ExecutePreparedStmt(ctx, stmtID, args...)
+	params := make([]types.Datum, len(args))
+	for i := 0; i < len(params); i++ {
+		params[i] = types.NewDatum(args[i])
+	}
+	rs, err := tk.Se.ExecutePreparedStmt(ctx, stmtID, params)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -175,6 +210,48 @@ func (tk *TestKit) MustExec(sql string, args ...interface{}) {
 	}
 }
 
+// HasPlan checks if the result execution plan contains specific plan.
+func (tk *TestKit) HasPlan(sql string, plan string, args ...interface{}) bool {
+	rs := tk.MustQuery("explain "+sql, args...)
+	for i := range rs.rows {
+		if strings.Contains(rs.rows[i][0], plan) {
+			return true
+		}
+	}
+	return false
+}
+
+// MustUseIndex checks if the result execution plan contains specific index(es).
+func (tk *TestKit) MustUseIndex(sql string, index string, args ...interface{}) bool {
+	rs := tk.MustQuery("explain "+sql, args...)
+	for i := range rs.rows {
+		if strings.Contains(rs.rows[i][3], "index:"+index) {
+			return true
+		}
+	}
+	return false
+}
+
+// MustIndexLookup checks whether the plan for the sql is IndexLookUp.
+func (tk *TestKit) MustIndexLookup(sql string, args ...interface{}) *Result {
+	tk.c.Assert(tk.HasPlan(sql, "IndexLookUp", args...), check.IsTrue)
+	return tk.MustQuery(sql, args...)
+}
+
+// MustTableDual checks whether the plan for the sql is TableDual.
+func (tk *TestKit) MustTableDual(sql string, args ...interface{}) *Result {
+	tk.c.Assert(tk.HasPlan(sql, "TableDual", args...), check.IsTrue)
+	return tk.MustQuery(sql, args...)
+}
+
+// MustPointGet checks whether the plan for the sql is Point_Get.
+func (tk *TestKit) MustPointGet(sql string, args ...interface{}) *Result {
+	rs := tk.MustQuery("explain "+sql, args...)
+	tk.c.Assert(len(rs.rows), check.Equals, 1)
+	tk.c.Assert(strings.Contains(rs.rows[0][0], "Point_Get"), check.IsTrue, check.Commentf("plan %v", rs.rows[0][0]))
+	return tk.MustQuery(sql, args...)
+}
+
 // MustQuery query the statements and returns result rows.
 // If expected result is set it asserts the query result equals expected result.
 func (tk *TestKit) MustQuery(sql string, args ...interface{}) *Result {
@@ -183,6 +260,17 @@ func (tk *TestKit) MustQuery(sql string, args ...interface{}) *Result {
 	tk.c.Assert(errors.ErrorStack(err), check.Equals, "", comment)
 	tk.c.Assert(rs, check.NotNil, comment)
 	return tk.ResultSetToResult(rs, comment)
+}
+
+// QueryToErr executes a sql statement and discard results.
+func (tk *TestKit) QueryToErr(sql string, args ...interface{}) error {
+	comment := check.Commentf("sql:%s, args:%v", sql, args)
+	res, err := tk.Exec(sql, args...)
+	tk.c.Assert(errors.ErrorStack(err), check.Equals, "", comment)
+	tk.c.Assert(res, check.NotNil, comment)
+	_, resErr := session.GetRows4Test(context.Background(), tk.Se, res)
+	tk.c.Assert(res.Close(), check.IsNil)
+	return resErr
 }
 
 // ExecToErr executes a sql statement and discard results.
@@ -194,32 +282,47 @@ func (tk *TestKit) ExecToErr(sql string, args ...interface{}) error {
 	return err
 }
 
+// MustGetErrMsg executes a sql statement and assert it's error message.
+func (tk *TestKit) MustGetErrMsg(sql string, errStr string) {
+	err := tk.ExecToErr(sql)
+	tk.c.Assert(err, check.NotNil)
+	tk.c.Assert(err.Error(), check.Equals, errStr)
+}
+
+// MustGetErrCode executes a sql statement and assert it's error code.
+func (tk *TestKit) MustGetErrCode(sql string, errCode int) {
+	_, err := tk.Exec(sql)
+	tk.c.Assert(err, check.NotNil)
+	originErr := errors.Cause(err)
+	tErr, ok := originErr.(*terror.Error)
+	tk.c.Assert(ok, check.IsTrue, check.Commentf("expect type 'terror.Error', but obtain '%T'", originErr))
+	sqlErr := tErr.ToSQLError()
+	tk.c.Assert(int(sqlErr.Code), check.Equals, errCode, check.Commentf("Assertion failed, origin err:\n  %v", sqlErr))
+}
+
 // ResultSetToResult converts sqlexec.RecordSet to testkit.Result.
 // It is used to check results of execute statement in binary mode.
 func (tk *TestKit) ResultSetToResult(rs sqlexec.RecordSet, comment check.CommentInterface) *Result {
-	rows, err := session.GetRows4Test(context.Background(), tk.Se, rs)
-	tk.c.Assert(errors.ErrorStack(err), check.Equals, "", comment)
-	err = rs.Close()
-	tk.c.Assert(errors.ErrorStack(err), check.Equals, "", comment)
-	sRows := make([][]string, len(rows))
-	for i := range rows {
-		row := rows[i]
-		iRow := make([]string, row.Len())
-		for j := 0; j < row.Len(); j++ {
-			if row.IsNull(j) {
-				iRow[j] = "<nil>"
-			} else {
-				d := row.GetDatum(j, &rs.Fields()[j].Column.FieldType)
-				iRow[j], err = d.ToString()
-				tk.c.Assert(err, check.IsNil)
-			}
-		}
-		sRows[i] = iRow
-	}
+	return tk.ResultSetToResultWithCtx(context.Background(), rs, comment)
+}
+
+// ResultSetToResultWithCtx converts sqlexec.RecordSet to testkit.Result.
+func (tk *TestKit) ResultSetToResultWithCtx(ctx context.Context, rs sqlexec.RecordSet, comment check.CommentInterface) *Result {
+	sRows, err := session.ResultSetToStringSlice(ctx, tk.Se, rs)
+	tk.c.Check(err, check.IsNil, comment)
 	return &Result{rows: sRows, c: tk.c, comment: comment}
 }
 
 // Rows is similar to RowsWithSep, use white space as separator string.
 func Rows(args ...string) [][]interface{} {
 	return testutil.RowsWithSep(" ", args...)
+}
+
+// GetTableID gets table ID by name.
+func (tk *TestKit) GetTableID(tableName string) int64 {
+	dom := domain.GetDomain(tk.Se)
+	is := dom.InfoSchema()
+	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr(tableName))
+	tk.c.Assert(err, check.IsNil)
+	return tbl.Meta().ID
 }

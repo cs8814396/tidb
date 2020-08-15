@@ -42,12 +42,12 @@ type testTableSuite struct {
 
 // testTableInfo creates a test table with num int columns and with no index.
 func testTableInfo(c *C, d *ddl, name string, num int) *model.TableInfo {
-	var err error
 	tblInfo := &model.TableInfo{
 		Name: model.NewCIStr(name),
 	}
-	tblInfo.ID, err = d.genGlobalID()
+	genIDs, err := d.genGlobalIDs(1)
 	c.Assert(err, IsNil)
+	tblInfo.ID = genIDs[0]
 
 	cols := make([]*model.ColumnInfo, num)
 	for i := range cols {
@@ -62,20 +62,64 @@ func testTableInfo(c *C, d *ddl, name string, num int) *model.TableInfo {
 		col.ID = allocateColumnID(tblInfo)
 		cols[i] = col
 	}
-
 	tblInfo.Columns = cols
+	tblInfo.Charset = "utf8"
+	tblInfo.Collate = "utf8_bin"
+	return tblInfo
+}
+
+// testTableInfoWithPartition creates a test table with num int columns and with no index.
+func testTableInfoWithPartition(c *C, d *ddl, name string, num int) *model.TableInfo {
+	tblInfo := testTableInfo(c, d, name, num)
+	genIDs, err := d.genGlobalIDs(1)
+	c.Assert(err, IsNil)
+	pid := genIDs[0]
+	tblInfo.Partition = &model.PartitionInfo{
+		Type:   model.PartitionTypeRange,
+		Expr:   tblInfo.Columns[0].Name.L,
+		Enable: true,
+		Definitions: []model.PartitionDefinition{{
+			ID:       pid,
+			Name:     model.NewCIStr("p0"),
+			LessThan: []string{"maxvalue"},
+		}},
+	}
 
 	return tblInfo
 }
 
+// testTableInfoWithPartitionLessThan creates a test table with num int columns and one partition specified with lessthan.
+func testTableInfoWithPartitionLessThan(c *C, d *ddl, name string, num int, lessthan string) *model.TableInfo {
+	tblInfo := testTableInfoWithPartition(c, d, name, num)
+	tblInfo.Partition.Definitions[0].LessThan = []string{lessthan}
+	return tblInfo
+}
+
+func testAddedNewTablePartitionInfo(c *C, d *ddl, tblInfo *model.TableInfo, partName, lessthan string) *model.PartitionInfo {
+	genIDs, err := d.genGlobalIDs(1)
+	c.Assert(err, IsNil)
+	pid := genIDs[0]
+	// the new added partition should change the partition state to state none at the beginning.
+	return &model.PartitionInfo{
+		Type:   model.PartitionTypeRange,
+		Expr:   tblInfo.Columns[0].Name.L,
+		Enable: true,
+		Definitions: []model.PartitionDefinition{{
+			ID:       pid,
+			Name:     model.NewCIStr(partName),
+			LessThan: []string{lessthan},
+		}},
+	}
+}
+
 // testViewInfo creates a test view with num int columns.
 func testViewInfo(c *C, d *ddl, name string, num int) *model.TableInfo {
-	var err error
 	tblInfo := &model.TableInfo{
 		Name: model.NewCIStr(name),
 	}
-	tblInfo.ID, err = d.genGlobalID()
+	genIDs, err := d.genGlobalIDs(1)
 	c.Assert(err, IsNil)
+	tblInfo.ID = genIDs[0]
 
 	cols := make([]*model.ColumnInfo, num)
 	viewCols := make([]model.CIStr, num)
@@ -161,6 +205,47 @@ func testRenameTable(c *C, ctx sessionctx.Context, d *ddl, newSchemaID, oldSchem
 	return job
 }
 
+func testLockTable(c *C, ctx sessionctx.Context, d *ddl, newSchemaID int64, tblInfo *model.TableInfo, lockTp model.TableLockType) *model.Job {
+	arg := &lockTablesArg{
+		LockTables: []model.TableLockTpInfo{{SchemaID: newSchemaID, TableID: tblInfo.ID, Tp: lockTp}},
+		SessionInfo: model.SessionInfo{
+			ServerID:  d.GetID(),
+			SessionID: ctx.GetSessionVars().ConnectionID,
+		},
+	}
+	job := &model.Job{
+		SchemaID:   newSchemaID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionLockTable,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{arg},
+	}
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v})
+	return job
+}
+
+func checkTableLockedTest(c *C, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, serverID string, sessionID uint64, lockTp model.TableLockType) {
+	err := kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
+		t := meta.NewMeta(txn)
+		info, err := t.GetTable(dbInfo.ID, tblInfo.ID)
+		c.Assert(err, IsNil)
+
+		c.Assert(info, NotNil)
+		c.Assert(info.Lock, NotNil)
+		c.Assert(len(info.Lock.Sessions) == 1, IsTrue)
+		c.Assert(info.Lock.Sessions[0].ServerID, Equals, serverID)
+		c.Assert(info.Lock.Sessions[0].SessionID, Equals, sessionID)
+		c.Assert(info.Lock.Tp, Equals, lockTp)
+		c.Assert(info.Lock.State, Equals, model.TableLockStatePublic)
+		return nil
+	})
+	c.Assert(err, IsNil)
+}
+
 func testDropTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
@@ -177,8 +262,9 @@ func testDropTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, t
 }
 
 func testTruncateTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
-	newTableID, err := d.genGlobalID()
+	genIDs, err := d.genGlobalIDs(1)
 	c.Assert(err, IsNil)
+	newTableID := genIDs[0]
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
 		TableID:    tblInfo.ID,
@@ -196,7 +282,7 @@ func testTruncateTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInf
 }
 
 func testCheckTableState(c *C, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, state model.SchemaState) {
-	kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
+	err := kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		info, err := t.GetTable(dbInfo.ID, tblInfo.ID)
 		c.Assert(err, IsNil)
@@ -210,6 +296,7 @@ func testCheckTableState(c *C, d *ddl, dbInfo *model.DBInfo, tblInfo *model.Tabl
 		c.Assert(info.State, Equals, state)
 		return nil
 	})
+	c.Assert(err, IsNil)
 }
 
 func testGetTable(c *C, d *ddl, schemaID int64, tableID int64) table.Table {
@@ -235,8 +322,8 @@ func testGetTableWithError(d *ddl, schemaID, tableID int64) (table.Table, error)
 	if tblInfo == nil {
 		return nil, errors.New("table not found")
 	}
-	alloc := autoid.NewAllocator(d.store, schemaID, false)
-	tbl, err := table.TableFromMeta(alloc, tblInfo)
+	alloc := autoid.NewAllocator(d.store, schemaID, false, autoid.RowIDAllocType)
+	tbl, err := table.TableFromMeta(autoid.NewAllocators(alloc), tblInfo)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -245,7 +332,12 @@ func testGetTableWithError(d *ddl, schemaID, tableID int64) (table.Table, error)
 
 func (s *testTableSuite) SetUpSuite(c *C) {
 	s.store = testCreateStore(c, "test_table")
-	s.d = testNewDDL(context.Background(), nil, s.store, nil, nil, testLease)
+	s.d = testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(s.store),
+		WithLease(testLease),
+	)
 
 	s.dbInfo = testSchemaInfo(c, s.d, "test")
 	testCreateSchema(c, testNewContext(s.d), s.d, s.dbInfo)
@@ -296,6 +388,11 @@ func (s *testTableSuite) TestTable(c *C) {
 	job = testRenameTable(c, ctx, d, dbInfo1.ID, s.dbInfo.ID, tblInfo)
 	testCheckTableState(c, d, dbInfo1, tblInfo, model.StatePublic)
 	testCheckJobDone(c, d, job, true)
+
+	job = testLockTable(c, ctx, d, dbInfo1.ID, tblInfo, model.TableLockWrite)
+	testCheckTableState(c, d, dbInfo1, tblInfo, model.StatePublic)
+	testCheckJobDone(c, d, job, true)
+	checkTableLockedTest(c, d, dbInfo1, tblInfo, d.GetID(), ctx.GetSessionVars().ConnectionID, model.TableLockWrite)
 }
 
 func (s *testTableSuite) TestTableResume(c *C) {

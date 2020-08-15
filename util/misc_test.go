@@ -14,10 +14,21 @@
 package util
 
 import (
+	"bytes"
+	"crypto/x509/pkix"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/fastrand"
+	"github.com/pingcap/tidb/util/memory"
+	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
@@ -112,4 +123,108 @@ func (s *testMiscSuite) TestCompatibleParseGCTime(c *C) {
 		_, err := CompatibleParseGCTime(value)
 		c.Assert(err, NotNil)
 	}
+}
+
+func (s *testMiscSuite) TestX509NameParseMatch(c *C) {
+	check := pkix.Name{
+		Names: []pkix.AttributeTypeAndValue{
+			MockPkixAttribute(Country, "SE"),
+			MockPkixAttribute(Province, "Stockholm2"),
+			MockPkixAttribute(Locality, "Stockholm"),
+			MockPkixAttribute(Organization, "MySQL demo client certificate"),
+			MockPkixAttribute(OrganizationalUnit, "testUnit"),
+			MockPkixAttribute(CommonName, "client"),
+			MockPkixAttribute(Email, "client@example.com"),
+		},
+	}
+	c.Assert(X509NameOnline(check), Equals, "/C=SE/ST=Stockholm2/L=Stockholm/O=MySQL demo client certificate/OU=testUnit/CN=client/emailAddress=client@example.com")
+	check = pkix.Name{}
+	c.Assert(X509NameOnline(check), Equals, "")
+}
+
+func (s *testMiscSuite) TestBasicFunc(c *C) {
+	// Test for GetStack.
+	b := GetStack()
+	c.Assert(len(b) < 4096, IsTrue)
+
+	// Test for WithRecovery.
+	var recover interface{}
+	WithRecovery(func() {
+		panic("test")
+	}, func(r interface{}) {
+		recover = r
+	})
+	c.Assert(recover, Equals, "test")
+
+	// Test for SyntaxError.
+	c.Assert(SyntaxError(nil), IsNil)
+	c.Assert(terror.ErrorEqual(SyntaxError(errors.New("test")), parser.ErrParse), IsTrue)
+	c.Assert(terror.ErrorEqual(SyntaxError(parser.ErrSyntax.GenWithStackByArgs()), parser.ErrSyntax), IsTrue)
+
+	// Test for SyntaxWarn.
+	c.Assert(SyntaxWarn(nil), IsNil)
+	c.Assert(terror.ErrorEqual(SyntaxWarn(errors.New("test")), parser.ErrParse), IsTrue)
+
+	// Test for ProcessInfo.
+	pi := ProcessInfo{
+		ID:      1,
+		User:    "test",
+		Host:    "www",
+		DB:      "db",
+		Command: mysql.ComSleep,
+		Plan:    nil,
+		Time:    time.Now(),
+		State:   3,
+		Info:    "test",
+		StmtCtx: &stmtctx.StatementContext{
+			MemTracker: memory.NewTracker(stringutil.StringerStr(""), -1),
+		},
+	}
+	row := pi.ToRowForShow(false)
+	row2 := pi.ToRowForShow(true)
+	c.Assert(row, DeepEquals, row2)
+	c.Assert(len(row), Equals, 8)
+	c.Assert(row[0], Equals, pi.ID)
+	c.Assert(row[1], Equals, pi.User)
+	c.Assert(row[2], Equals, pi.Host)
+	c.Assert(row[3], Equals, pi.DB)
+	c.Assert(row[4], Equals, "Sleep")
+	c.Assert(row[5], Equals, uint64(0))
+	c.Assert(row[6], Equals, "in transaction; autocommit")
+	c.Assert(row[7], Equals, "test")
+
+	row3 := pi.ToRow(time.UTC)
+	c.Assert(row3[:8], DeepEquals, row)
+	c.Assert(row3[8], Equals, int64(0))
+
+	// Test for RandomBuf.
+	buf := fastrand.Buf(5)
+	c.Assert(len(buf), Equals, 5)
+	c.Assert(bytes.Contains(buf, []byte("$")), IsFalse)
+	c.Assert(bytes.Contains(buf, []byte{0}), IsFalse)
+}
+
+func (*testMiscSuite) TestToPB(c *C) {
+	column := &model.ColumnInfo{
+		ID:           1,
+		Name:         model.NewCIStr("c"),
+		Offset:       0,
+		DefaultValue: 0,
+		FieldType:    *types.NewFieldType(0),
+		Hidden:       true,
+	}
+	column.Collate = "utf8mb4_general_ci"
+
+	column2 := &model.ColumnInfo{
+		ID:           1,
+		Name:         model.NewCIStr("c"),
+		Offset:       0,
+		DefaultValue: 0,
+		FieldType:    *types.NewFieldType(0),
+		Hidden:       true,
+	}
+	column2.Collate = "utf8mb4_bin"
+
+	c.Assert(ColumnToProto(column).String(), Equals, "column_id:1 collation:45 columnLen:-1 decimal:-1 ")
+	c.Assert(ColumnsToProto([]*model.ColumnInfo{column, column2}, false)[0].String(), Equals, "column_id:1 collation:45 columnLen:-1 decimal:-1 ")
 }

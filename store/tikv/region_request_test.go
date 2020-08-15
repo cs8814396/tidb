@@ -15,19 +15,23 @@ package tikv
 
 import (
 	"context"
+	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
+	"github.com/pingcap/tidb/util/storeutil"
+	goctx "golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
@@ -42,39 +46,124 @@ type testRegionRequestSuite struct {
 	mvccStore           mocktikv.MVCCStore
 }
 
+type testStoreLimitSuite struct {
+	cluster             *mocktikv.Cluster
+	storeIDs            []uint64
+	peerIDs             []uint64
+	regionID            uint64
+	leaderPeer          uint64
+	cache               *RegionCache
+	bo                  *Backoffer
+	regionRequestSender *RegionRequestSender
+	mvccStore           mocktikv.MVCCStore
+}
+
 var _ = Suite(&testRegionRequestSuite{})
+var _ = Suite(&testStoreLimitSuite{})
 
 func (s *testRegionRequestSuite) SetUpTest(c *C) {
-	s.cluster = mocktikv.NewCluster()
+	s.cluster = mocktikv.NewCluster(mocktikv.MustNewMVCCStore())
 	s.store, s.peer, s.region = mocktikv.BootstrapWithSingleStore(s.cluster)
 	pdCli := &codecPDClient{mocktikv.NewPDClient(s.cluster)}
 	s.cache = NewRegionCache(pdCli)
-	s.bo = NewBackoffer(context.Background(), 1)
+	s.bo = NewNoopBackoff(context.Background())
 	s.mvccStore = mocktikv.MustNewMVCCStore()
 	client := mocktikv.NewRPCClient(s.cluster, s.mvccStore)
 	s.regionRequestSender = NewRegionRequestSender(s.cache, client)
 }
 
+func (s *testStoreLimitSuite) SetUpTest(c *C) {
+	s.cluster = mocktikv.NewCluster(mocktikv.MustNewMVCCStore())
+	s.storeIDs, s.peerIDs, s.regionID, s.leaderPeer = mocktikv.BootstrapWithMultiStores(s.cluster, 3)
+	pdCli := &codecPDClient{mocktikv.NewPDClient(s.cluster)}
+	s.cache = NewRegionCache(pdCli)
+	s.bo = NewNoopBackoff(context.Background())
+	s.mvccStore = mocktikv.MustNewMVCCStore()
+	client := mocktikv.NewRPCClient(s.cluster, s.mvccStore)
+	s.regionRequestSender = NewRegionRequestSender(s.cache, client)
+}
+
+func (s *testRegionRequestSuite) TearDownTest(c *C) {
+	s.cache.Close()
+}
+
+func (s *testStoreLimitSuite) TearDownTest(c *C) {
+	s.cache.Close()
+}
+
+type fnClient struct {
+	fn func(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error)
+}
+
+func (f *fnClient) Close() error {
+	return nil
+}
+
+func (f *fnClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
+	return f.fn(ctx, addr, req, timeout)
+}
+
+func (s *testRegionRequestSuite) TestOnRegionError(c *C) {
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
+	region, err := s.cache.LocateRegionByID(s.bo, s.region)
+	c.Assert(err, IsNil)
+	c.Assert(region, NotNil)
+
+	// test stale command retry.
+	func() {
+		oc := s.regionRequestSender.client
+		defer func() {
+			s.regionRequestSender.client = oc
+		}()
+		s.regionRequestSender.client = &fnClient{func(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (response *tikvrpc.Response, err error) {
+			staleResp := &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{
+				RegionError: &errorpb.Error{StaleCommand: &errorpb.StaleCommand{}},
+			}}
+			return staleResp, nil
+		}}
+		bo := NewBackofferWithVars(context.Background(), 5, nil)
+		resp, err := s.regionRequestSender.SendReq(bo, req, region.Region, time.Second)
+		c.Assert(err, NotNil)
+		c.Assert(resp, IsNil)
+	}()
+
+}
+
+func (s *testStoreLimitSuite) TestStoreTokenLimit(c *C) {
+	req := tikvrpc.NewRequest(tikvrpc.CmdPrewrite, &kvrpcpb.PrewriteRequest{}, kvrpcpb.Context{})
+	region, err := s.cache.LocateRegionByID(s.bo, s.regionID)
+	c.Assert(err, IsNil)
+	c.Assert(region, NotNil)
+	oldStoreLimit := storeutil.StoreLimit.Load()
+	storeutil.StoreLimit.Store(500)
+	s.cache.getStoreByStoreID(s.storeIDs[0]).tokenCount.Store(500)
+	// cause there is only one region in this cluster, regionID maps this leader.
+	resp, err := s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
+	c.Assert(err, NotNil)
+	c.Assert(resp, IsNil)
+	c.Assert(err.Error(), Equals, "[tikv:9008]Store token is up to the limit, store id = 1")
+	storeutil.StoreLimit.Store(oldStoreLimit)
+}
+
 func (s *testRegionRequestSuite) TestOnSendFailedWithStoreRestart(c *C) {
-	req := &tikvrpc.Request{
-		Type: tikvrpc.CmdRawPut,
-		RawPut: &kvrpcpb.RawPutRequest{
-			Key:   []byte("key"),
-			Value: []byte("value"),
-		},
-	}
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
 	region, err := s.cache.LocateRegionByID(s.bo, s.region)
 	c.Assert(err, IsNil)
 	c.Assert(region, NotNil)
 	resp, err := s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
 	c.Assert(err, IsNil)
-	c.Assert(resp.RawPut, NotNil)
+	c.Assert(resp.Resp, NotNil)
 
 	// stop store.
 	s.cluster.StopStore(s.store)
 	_, err = s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
 	c.Assert(err, NotNil)
-	c.Assert(strings.Contains(err.Error(), "try again later"), IsTrue)
 
 	// start store.
 	s.cluster.StartStore(s.store)
@@ -86,23 +175,73 @@ func (s *testRegionRequestSuite) TestOnSendFailedWithStoreRestart(c *C) {
 	c.Assert(region, NotNil)
 	resp, err = s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
 	c.Assert(err, IsNil)
-	c.Assert(resp.RawPut, NotNil)
+	c.Assert(resp.Resp, NotNil)
 }
 
-func (s *testRegionRequestSuite) TestOnSendFailedWithCancelled(c *C) {
-	req := &tikvrpc.Request{
-		Type: tikvrpc.CmdRawPut,
-		RawPut: &kvrpcpb.RawPutRequest{
-			Key:   []byte("key"),
-			Value: []byte("value"),
-		},
-	}
+func (s *testRegionRequestSuite) TestOnSendFailedWithCloseKnownStoreThenUseNewOne(c *C) {
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
+
+	// add new store2 and make store2 as leader.
+	store2 := s.cluster.AllocID()
+	peer2 := s.cluster.AllocID()
+	s.cluster.AddStore(store2, fmt.Sprintf("store%d", store2))
+	s.cluster.AddPeer(s.region, store2, peer2)
+	s.cluster.ChangeLeader(s.region, peer2)
+
 	region, err := s.cache.LocateRegionByID(s.bo, s.region)
 	c.Assert(err, IsNil)
 	c.Assert(region, NotNil)
 	resp, err := s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
 	c.Assert(err, IsNil)
-	c.Assert(resp.RawPut, NotNil)
+	c.Assert(resp.Resp, NotNil)
+
+	// stop store2 and make store1 as new leader.
+	s.cluster.StopStore(store2)
+	s.cluster.ChangeLeader(s.region, s.peer)
+
+	// send to store2 fail and send to new leader store1.
+	bo2 := NewBackofferWithVars(context.Background(), 100, nil)
+	resp, err = s.regionRequestSender.SendReq(bo2, req, region.Region, time.Second)
+	c.Assert(err, IsNil)
+	regionErr, err := resp.GetRegionError()
+	c.Assert(err, IsNil)
+	c.Assert(regionErr, IsNil)
+	c.Assert(resp.Resp, NotNil)
+}
+
+func (s *testRegionRequestSuite) TestSendReqCtx(c *C) {
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
+	region, err := s.cache.LocateRegionByID(s.bo, s.region)
+	c.Assert(err, IsNil)
+	c.Assert(region, NotNil)
+	resp, ctx, err := s.regionRequestSender.SendReqCtx(s.bo, req, region.Region, time.Second, kv.TiKV)
+	c.Assert(err, IsNil)
+	c.Assert(resp.Resp, NotNil)
+	c.Assert(ctx, NotNil)
+	req.ReplicaRead = true
+	resp, ctx, err = s.regionRequestSender.SendReqCtx(s.bo, req, region.Region, time.Second, kv.TiKV)
+	c.Assert(err, IsNil)
+	c.Assert(resp.Resp, NotNil)
+	c.Assert(ctx, NotNil)
+}
+
+func (s *testRegionRequestSuite) TestOnSendFailedWithCancelled(c *C) {
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
+	region, err := s.cache.LocateRegionByID(s.bo, s.region)
+	c.Assert(err, IsNil)
+	c.Assert(region, NotNil)
+	resp, err := s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
+	c.Assert(err, IsNil)
+	c.Assert(resp.Resp, NotNil)
 
 	// set store to cancel state.
 	s.cluster.CancelStore(s.store)
@@ -119,17 +258,14 @@ func (s *testRegionRequestSuite) TestOnSendFailedWithCancelled(c *C) {
 	c.Assert(region, NotNil)
 	resp, err = s.regionRequestSender.SendReq(s.bo, req, region.Region, time.Second)
 	c.Assert(err, IsNil)
-	c.Assert(resp.RawPut, NotNil)
+	c.Assert(resp.Resp, NotNil)
 }
 
 func (s *testRegionRequestSuite) TestNoReloadRegionWhenCtxCanceled(c *C) {
-	req := &tikvrpc.Request{
-		Type: tikvrpc.CmdRawPut,
-		RawPut: &kvrpcpb.RawPutRequest{
-			Key:   []byte("key"),
-			Value: []byte("value"),
-		},
-	}
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
 	region, err := s.cache.LocateRegionByID(s.bo, s.region)
 	c.Assert(err, IsNil)
 	c.Assert(region, NotNil)
@@ -190,6 +326,18 @@ func (s *mockTikvGrpcServer) KvScanLock(context.Context, *kvrpcpb.ScanLockReques
 func (s *mockTikvGrpcServer) KvResolveLock(context.Context, *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	return nil, errors.New("unreachable")
 }
+func (s *mockTikvGrpcServer) KvPessimisticLock(context.Context, *kvrpcpb.PessimisticLockRequest) (*kvrpcpb.PessimisticLockResponse, error) {
+	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) KVPessimisticRollback(context.Context, *kvrpcpb.PessimisticRollbackRequest) (*kvrpcpb.PessimisticRollbackResponse, error) {
+	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) KvCheckTxnStatus(ctx context.Context, in *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
+	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) KvTxnHeartBeat(ctx context.Context, in *kvrpcpb.TxnHeartBeatRequest) (*kvrpcpb.TxnHeartBeatResponse, error) {
+	return nil, errors.New("unreachable")
+}
 func (s *mockTikvGrpcServer) KvGC(context.Context, *kvrpcpb.GCRequest) (*kvrpcpb.GCResponse, error) {
 	return nil, errors.New("unreachable")
 }
@@ -226,8 +374,23 @@ func (s *mockTikvGrpcServer) RawBatchScan(context.Context, *kvrpcpb.RawBatchScan
 func (s *mockTikvGrpcServer) UnsafeDestroyRange(context.Context, *kvrpcpb.UnsafeDestroyRangeRequest) (*kvrpcpb.UnsafeDestroyRangeResponse, error) {
 	return nil, errors.New("unreachable")
 }
+func (s *mockTikvGrpcServer) RegisterLockObserver(context.Context, *kvrpcpb.RegisterLockObserverRequest) (*kvrpcpb.RegisterLockObserverResponse, error) {
+	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) CheckLockObserver(context.Context, *kvrpcpb.CheckLockObserverRequest) (*kvrpcpb.CheckLockObserverResponse, error) {
+	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) RemoveLockObserver(context.Context, *kvrpcpb.RemoveLockObserverRequest) (*kvrpcpb.RemoveLockObserverResponse, error) {
+	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) PhysicalScanLock(context.Context, *kvrpcpb.PhysicalScanLockRequest) (*kvrpcpb.PhysicalScanLockResponse, error) {
+	return nil, errors.New("unreachable")
+}
 func (s *mockTikvGrpcServer) Coprocessor(context.Context, *coprocessor.Request) (*coprocessor.Response, error) {
 	return nil, errors.New("unreachable")
+}
+func (s *mockTikvGrpcServer) BatchCoprocessor(*coprocessor.BatchRequest, tikvpb.Tikv_BatchCoprocessorServer) error {
+	return errors.New("unreachable")
 }
 func (s *mockTikvGrpcServer) Raft(tikvpb.Tikv_RaftServer) error {
 	return errors.New("unreachable")
@@ -256,6 +419,38 @@ func (s *mockTikvGrpcServer) BatchCommands(tikvpb.Tikv_BatchCommandsServer) erro
 	return errors.New("unreachable")
 }
 
+func (s *mockTikvGrpcServer) ReadIndex(context.Context, *kvrpcpb.ReadIndexRequest) (*kvrpcpb.ReadIndexResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) VerGet(context.Context, *kvrpcpb.VerGetRequest) (*kvrpcpb.VerGetResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) VerBatchGet(context.Context, *kvrpcpb.VerBatchGetRequest) (*kvrpcpb.VerBatchGetResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) VerMut(context.Context, *kvrpcpb.VerMutRequest) (*kvrpcpb.VerMutResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) VerBatchMut(context.Context, *kvrpcpb.VerBatchMutRequest) (*kvrpcpb.VerBatchMutResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) VerScan(context.Context, *kvrpcpb.VerScanRequest) (*kvrpcpb.VerScanResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) VerDeleteRange(context.Context, *kvrpcpb.VerDeleteRangeRequest) (*kvrpcpb.VerDeleteRangeResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
+func (s *mockTikvGrpcServer) KvCheckSecondaryLocks(c goctx.Context, request *kvrpcpb.CheckSecondaryLocksRequest) (*kvrpcpb.CheckSecondaryLocksResponse, error) {
+	return nil, errors.New("unreachable")
+}
+
 func (s *testRegionRequestSuite) TestNoReloadRegionForGrpcWhenCtxCanceled(c *C) {
 	// prepare a mock tikv grpc server
 	addr := "localhost:56341"
@@ -272,13 +467,10 @@ func (s *testRegionRequestSuite) TestNoReloadRegionForGrpcWhenCtxCanceled(c *C) 
 
 	client := newRPCClient(config.Security{})
 	sender := NewRegionRequestSender(s.cache, client)
-	req := &tikvrpc.Request{
-		Type: tikvrpc.CmdRawPut,
-		RawPut: &kvrpcpb.RawPutRequest{
-			Key:   []byte("key"),
-			Value: []byte("value"),
-		},
-	}
+	req := tikvrpc.NewRequest(tikvrpc.CmdRawPut, &kvrpcpb.RawPutRequest{
+		Key:   []byte("key"),
+		Value: []byte("value"),
+	})
 	region, err := s.cache.LocateRegionByID(s.bo, s.region)
 	c.Assert(err, IsNil)
 

@@ -17,44 +17,40 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	_ "runtime" // import link package
+	_ "unsafe"  // required by go:linkname
 
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/util/israce"
-	log "github.com/sirupsen/logrus"
-)
-
-// Version information.
-var (
-	TiDBBuildTS   = "None"
-	TiDBGitHash   = "None"
-	TiDBGitBranch = "None"
-	GoVersion     = "None"
-	// TiKVMinVersion is the minimum version of TiKV that can be compatible with the current TiDB.
-	TiKVMinVersion = "2.1.0-alpha.1-ff3dd160846b7d1aed9079c389fc188f7f5ea13e"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/versioninfo"
+	"go.uber.org/zap"
 )
 
 // PrintTiDBInfo prints the TiDB version information.
 func PrintTiDBInfo() {
-	log.Infof("Welcome to TiDB.")
-	log.Infof("Release Version: %s", mysql.TiDBReleaseVersion)
-	log.Infof("Git Commit Hash: %s", TiDBGitHash)
-	log.Infof("Git Branch: %s", TiDBGitBranch)
-	log.Infof("UTC Build Time:  %s", TiDBBuildTS)
-	log.Infof("GoVersion:  %s", GoVersion)
-	log.Infof("Race Enabled: %v", israce.RaceEnabled)
-	log.Infof("Check Table Before Drop: %v", config.CheckTableBeforeDrop)
-	log.Infof("TiKV Min Version: %s", TiKVMinVersion)
+	logutil.BgLogger().Info("Welcome to TiDB.",
+		zap.String("Release Version", mysql.TiDBReleaseVersion),
+		zap.String("Edition", versioninfo.TiDBEdition),
+		zap.String("Git Commit Hash", versioninfo.TiDBGitHash),
+		zap.String("Git Branch", versioninfo.TiDBGitBranch),
+		zap.String("UTC Build Time", versioninfo.TiDBBuildTS),
+		zap.String("GoVersion", buildVersion),
+		zap.Bool("Race Enabled", israce.RaceEnabled),
+		zap.Bool("Check Table Before Drop", config.CheckTableBeforeDrop),
+		zap.String("TiKV Min Version", versioninfo.TiKVMinVersion))
 	configJSON, err := json.Marshal(config.GetGlobalConfig())
 	if err != nil {
 		panic(err)
 	}
-	log.Infof("Config: %s", configJSON)
+	logutil.BgLogger().Info("loaded config", zap.ByteString("config", configJSON))
 }
 
 // GetTiDBInfo returns the git hash and build time of this tidb-server binary.
 func GetTiDBInfo() string {
 	return fmt.Sprintf("Release Version: %s\n"+
+		"Edition: %s\n"+
 		"Git Commit Hash: %s\n"+
 		"Git Branch: %s\n"+
 		"UTC Build Time: %s\n"+
@@ -63,12 +59,13 @@ func GetTiDBInfo() string {
 		"TiKV Min Version: %s\n"+
 		"Check Table Before Drop: %v",
 		mysql.TiDBReleaseVersion,
-		TiDBGitHash,
-		TiDBGitBranch,
-		TiDBBuildTS,
-		GoVersion,
+		versioninfo.TiDBEdition,
+		versioninfo.TiDBGitHash,
+		versioninfo.TiDBGitBranch,
+		versioninfo.TiDBBuildTS,
+		buildVersion,
 		israce.RaceEnabled,
-		TiKVMinVersion,
+		versioninfo.TiKVMinVersion,
 		config.CheckTableBeforeDrop)
 }
 
@@ -166,3 +163,6 @@ func GetPrintResult(cols []string, datas [][]string) (string, bool) {
 	value = append(value, getPrintDivLine(maxColLen)...)
 	return string(value), true
 }
+
+//go:linkname buildVersion runtime.buildVersion
+var buildVersion string

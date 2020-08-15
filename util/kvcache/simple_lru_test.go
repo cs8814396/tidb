@@ -14,6 +14,8 @@
 package kvcache
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 
 	. "github.com/pingcap/check"
@@ -56,7 +58,7 @@ func (s *testLRUCacheSuite) TestPut(c *C) {
 	maxMem, err := memory.MemTotal()
 	c.Assert(err, IsNil)
 
-	lru := NewSimpleLRUCache(3, 0.1, maxMem)
+	lru := NewSimpleLRUCache(3, 0, maxMem)
 	c.Assert(lru.capacity, Equals, uint(3))
 
 	keys := make([]*mockCacheKey, 5)
@@ -106,6 +108,22 @@ func (s *testLRUCacheSuite) TestPut(c *C) {
 	c.Assert(root, IsNil)
 }
 
+func (s *testLRUCacheSuite) TestZeroQuota(c *C) {
+	lru := NewSimpleLRUCache(100, 0, 0)
+	c.Assert(lru.capacity, Equals, uint(100))
+
+	keys := make([]*mockCacheKey, 100)
+	vals := make([]int64, 100)
+
+	for i := 0; i < 100; i++ {
+		keys[i] = newMockHashKey(int64(i))
+		vals[i] = int64(i)
+		lru.Put(keys[i], vals[i])
+	}
+	c.Assert(lru.size, Equals, lru.capacity)
+	c.Assert(lru.size, Equals, uint(100))
+}
+
 func (s *testLRUCacheSuite) TestOOMGuard(c *C) {
 	maxMem, err := memory.MemTotal()
 	c.Assert(err, IsNil)
@@ -135,7 +153,7 @@ func (s *testLRUCacheSuite) TestGet(c *C) {
 	maxMem, err := memory.MemTotal()
 	c.Assert(err, IsNil)
 
-	lru := NewSimpleLRUCache(3, 0.1, maxMem)
+	lru := NewSimpleLRUCache(3, 0, maxMem)
 
 	keys := make([]*mockCacheKey, 5)
 	vals := make([]int64, 5)
@@ -178,7 +196,7 @@ func (s *testLRUCacheSuite) TestDelete(c *C) {
 	maxMem, err := memory.MemTotal()
 	c.Assert(err, IsNil)
 
-	lru := NewSimpleLRUCache(3, 0.1, maxMem)
+	lru := NewSimpleLRUCache(3, 0, maxMem)
 
 	keys := make([]*mockCacheKey, 3)
 	vals := make([]int64, 3)
@@ -207,7 +225,7 @@ func (s *testLRUCacheSuite) TestDeleteAll(c *C) {
 	maxMem, err := memory.MemTotal()
 	c.Assert(err, IsNil)
 
-	lru := NewSimpleLRUCache(3, 0.1, maxMem)
+	lru := NewSimpleLRUCache(3, 0, maxMem)
 
 	keys := make([]*mockCacheKey, 3)
 	vals := make([]int64, 3)
@@ -227,4 +245,41 @@ func (s *testLRUCacheSuite) TestDeleteAll(c *C) {
 		c.Assert(value, IsNil)
 		c.Assert(int(lru.size), Equals, 0)
 	}
+}
+
+func (s *testLRUCacheSuite) TestValues(c *C) {
+	maxMem, err := memory.MemTotal()
+	c.Assert(err, IsNil)
+
+	lru := NewSimpleLRUCache(5, 0, maxMem)
+
+	keys := make([]*mockCacheKey, 5)
+	vals := make([]int64, 5)
+
+	for i := 0; i < 5; i++ {
+		keys[i] = newMockHashKey(int64(i))
+		vals[i] = int64(i)
+		lru.Put(keys[i], vals[i])
+	}
+
+	values := lru.Values()
+	c.Assert(len(values), Equals, 5)
+	for i := 0; i < 5; i++ {
+		c.Assert(values[i], Equals, int64(4-i))
+	}
+}
+
+func (s *testLRUCacheSuite) TestPutProfileName(c *C) {
+	lru := NewSimpleLRUCache(3, 0, 10)
+	c.Assert(lru.capacity, Equals, uint(3))
+	t := reflect.TypeOf(*lru)
+	pt := reflect.TypeOf(lru)
+	functionName := ""
+	for i := 0; i < pt.NumMethod(); i++ {
+		if pt.Method(i).Name == "Put" {
+			functionName = "Put"
+		}
+	}
+	pName := fmt.Sprintf("%s.(*%s).%s", t.PkgPath(), t.Name(), functionName)
+	c.Assert(pName, Equals, ProfileName)
 }

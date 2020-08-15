@@ -40,10 +40,20 @@ func OnShutdown(ctx context.Context, manifest *plugin.Manifest) error {
 	return nil
 }
 
-// NotifyEvent implements TiDB Audit plugin's NotifyEvent SPI.
-func NotifyEvent(ctx context.Context) error {
+// OnGeneralEvent implements TiDB Audit plugin's OnGeneralEvent SPI.
+func OnGeneralEvent(ctx context.Context, sctx *variable.SessionVars, event plugin.GeneralEvent, cmd string) {
 	fmt.Println("conn_ip_example notifiy called")
 	fmt.Println("variable test: ", variable.GetSysVar("conn_ip_example_test_variable").Value)
 	fmt.Printf("new connection by %s\n", ctx.Value("ip"))
+}
+
+// OnConnectionEvent implements TiDB Audit plugin's OnConnectionEvent SPI.
+func OnConnectionEvent(ctx context.Context, event plugin.ConnectionEvent, info *variable.ConnectionInfo) error {
+	var reason string
+	if r := ctx.Value(plugin.RejectReasonCtxValue{}); r != nil {
+		reason = r.(string)
+	}
+	fmt.Println("conn_ip_example onConnect called")
+	fmt.Printf("conenct event: %s, reason: %s\n", event, reason)
 	return nil
 }

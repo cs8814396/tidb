@@ -17,13 +17,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/kvcache"
-	binlog "github.com/pingcap/tipb/go-binlog"
+	"github.com/pingcap/tipb/go-binlog"
 )
 
 // Context is an interface for transaction and executive args environment.
@@ -73,16 +73,35 @@ type Context interface {
 	// StoreQueryFeedback stores the query feedback.
 	StoreQueryFeedback(feedback interface{})
 
+	// HasDirtyContent checks whether there's dirty update on the given table.
+	HasDirtyContent(tid int64) bool
+
 	// StmtCommit flush all changes by the statement to the underlying transaction.
-	StmtCommit() error
+	StmtCommit()
 	// StmtRollback provides statement level rollback.
 	StmtRollback()
 	// StmtGetMutation gets the binlog mutation for current statement.
 	StmtGetMutation(int64) *binlog.TableMutation
 	// StmtAddDirtyTableOP adds the dirty table operation for current statement.
-	StmtAddDirtyTableOP(op int, tid int64, handle int64, row []types.Datum)
+	StmtAddDirtyTableOP(op int, physicalID int64, handle kv.Handle)
 	// DDLOwnerChecker returns owner.DDLOwnerChecker.
 	DDLOwnerChecker() owner.DDLOwnerChecker
+	// AddTableLock adds table lock to the session lock map.
+	AddTableLock([]model.TableLockTpInfo)
+	// ReleaseTableLocks releases table locks in the session lock map.
+	ReleaseTableLocks(locks []model.TableLockTpInfo)
+	// ReleaseTableLockByTableID releases table locks in the session lock map by table ID.
+	ReleaseTableLockByTableIDs(tableIDs []int64)
+	// CheckTableLocked checks the table lock.
+	CheckTableLocked(tblID int64) (bool, model.TableLockType)
+	// GetAllTableLocks gets all table locks table id and db id hold by the session.
+	GetAllTableLocks() []model.TableLockTpInfo
+	// ReleaseAllTableLocks releases all table locks hold by the session.
+	ReleaseAllTableLocks()
+	// HasLockedTables uses to check whether this session locked any tables.
+	HasLockedTables() bool
+	// PrepareTSFuture uses to prepare timestamp by future.
+	PrepareTSFuture(ctx context.Context)
 }
 
 type basicCtxType int
@@ -109,10 +128,12 @@ const (
 	LastExecuteDDL basicCtxType = 3
 )
 
-// ConnID is the key in context.
-const ConnID kv.ContextKey = "conn ID"
+type connIDCtxKeyType struct{}
 
-// SetCommitCtx sets the variables for context before commit a transaction.
+// ConnID is the key in context.
+var ConnID = connIDCtxKeyType{}
+
+// SetCommitCtx sets connection id into context
 func SetCommitCtx(ctx context.Context, sessCtx Context) context.Context {
 	return context.WithValue(ctx, ConnID, sessCtx.GetSessionVars().ConnectionID)
 }

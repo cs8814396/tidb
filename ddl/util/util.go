@@ -14,9 +14,11 @@
 package util
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/terror"
@@ -28,23 +30,24 @@ import (
 )
 
 const (
-	deleteRangesTable         = `gc_delete_range`
-	doneDeleteRangesTable     = `gc_delete_range_done`
-	loadDeleteRangeSQL        = `SELECT HIGH_PRIORITY job_id, element_id, start_key, end_key FROM mysql.%s WHERE ts < %v`
-	recordDoneDeletedRangeSQL = `INSERT IGNORE INTO mysql.gc_delete_range_done SELECT * FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
-	completeDeleteRangeSQL    = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
-	updateDeleteRangeSQL      = `UPDATE mysql.gc_delete_range SET start_key = "%s" WHERE job_id = %d AND element_id = %d AND start_key = "%s"`
-	deleteDoneRecordSQL       = `DELETE FROM mysql.gc_delete_range_done WHERE job_id = %d AND element_id = %d`
+	deleteRangesTable            = `gc_delete_range`
+	doneDeleteRangesTable        = `gc_delete_range_done`
+	loadDeleteRangeSQL           = `SELECT HIGH_PRIORITY job_id, element_id, start_key, end_key FROM mysql.%s WHERE ts < %v`
+	recordDoneDeletedRangeSQL    = `INSERT IGNORE INTO mysql.gc_delete_range_done SELECT * FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
+	completeDeleteRangeSQL       = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
+	completeDeleteMultiRangesSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id in (%v)`
+	updateDeleteRangeSQL         = `UPDATE mysql.gc_delete_range SET start_key = "%s" WHERE job_id = %d AND element_id = %d AND start_key = "%s"`
+	deleteDoneRecordSQL          = `DELETE FROM mysql.gc_delete_range_done WHERE job_id = %d AND element_id = %d`
 )
 
 // DelRangeTask is for run delete-range command in gc_worker.
 type DelRangeTask struct {
 	JobID, ElementID int64
-	StartKey, EndKey []byte
+	StartKey, EndKey kv.Key
 }
 
 // Range returns the range [start, end) to delete.
-func (t DelRangeTask) Range() ([]byte, []byte) {
+func (t DelRangeTask) Range() (kv.Key, kv.Key) {
 	return t.StartKey, t.EndKey
 }
 
@@ -69,8 +72,8 @@ func loadDeleteRangesFromTable(ctx sessionctx.Context, table string, safePoint u
 	}
 
 	rs := rss[0]
-	req := rs.NewRecordBatch()
-	it := chunk.NewIterator4Chunk(req.Chunk)
+	req := rs.NewChunk()
+	it := chunk.NewIterator4Chunk(req)
 	for {
 		err = rs.Next(context.TODO(), req)
 		if err != nil {
@@ -119,6 +122,20 @@ func RemoveFromGCDeleteRange(ctx sessionctx.Context, jobID, elementID int64) err
 	return errors.Trace(err)
 }
 
+// RemoveMultiFromGCDeleteRange is exported for ddl pkg to use.
+func RemoveMultiFromGCDeleteRange(ctx sessionctx.Context, jobID int64, elementIDs []int64) error {
+	var buf bytes.Buffer
+	for i, elementID := range elementIDs {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(strconv.FormatInt(elementID, 10))
+	}
+	sql := fmt.Sprintf(completeDeleteMultiRangesSQL, jobID, buf.String())
+	_, err := ctx.(sqlexec.SQLExecutor).Execute(context.TODO(), sql)
+	return errors.Trace(err)
+}
+
 // DeleteDoneRecord removes a record from gc_delete_range_done table.
 func DeleteDoneRecord(ctx sessionctx.Context, dr DelRangeTask) error {
 	sql := fmt.Sprintf(deleteDoneRecordSQL, dr.JobID, dr.ElementID)
@@ -135,14 +152,30 @@ func UpdateDeleteRange(ctx sessionctx.Context, dr DelRangeTask, newStartKey, old
 	return errors.Trace(err)
 }
 
-const loadDDLReorgVarsSQL = "select HIGH_PRIORITY variable_name, variable_value from mysql.global_variables where variable_name in ('" +
-	variable.TiDBDDLReorgWorkerCount + "', '" +
-	variable.TiDBDDLReorgBatchSize + "')"
-
 // LoadDDLReorgVars loads ddl reorg variable from mysql.global_variables.
 func LoadDDLReorgVars(ctx sessionctx.Context) error {
+	return LoadGlobalVars(ctx, []string{variable.TiDBDDLReorgWorkerCount, variable.TiDBDDLReorgBatchSize})
+}
+
+// LoadDDLVars loads ddl variable from mysql.global_variables.
+func LoadDDLVars(ctx sessionctx.Context) error {
+	return LoadGlobalVars(ctx, []string{variable.TiDBDDLErrorCountLimit})
+}
+
+const loadGlobalVarsSQL = "select HIGH_PRIORITY variable_name, variable_value from mysql.global_variables where variable_name in (%s)"
+
+// LoadGlobalVars loads global variable from mysql.global_variables.
+func LoadGlobalVars(ctx sessionctx.Context, varNames []string) error {
 	if sctx, ok := ctx.(sqlexec.RestrictedSQLExecutor); ok {
-		rows, _, err := sctx.ExecRestrictedSQL(ctx, loadDDLReorgVarsSQL)
+		nameList := ""
+		for i, name := range varNames {
+			if i > 0 {
+				nameList += ", "
+			}
+			nameList += fmt.Sprintf("'%s'", name)
+		}
+		sql := fmt.Sprintf(loadGlobalVarsSQL, nameList)
+		rows, _, err := sctx.ExecRestrictedSQL(sql)
 		if err != nil {
 			return errors.Trace(err)
 		}

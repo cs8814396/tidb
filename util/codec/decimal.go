@@ -15,6 +15,7 @@ package codec
 
 import (
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/types"
 )
 
@@ -24,17 +25,24 @@ func EncodeDecimal(b []byte, dec *types.MyDecimal, precision, frac int) ([]byte,
 		precision, frac = dec.PrecisionAndFrac()
 	}
 	b = append(b, byte(precision), byte(frac))
-	bin, err := dec.ToBin(precision, frac)
-	b = append(b, bin...)
+	b, err := dec.WriteBin(precision, frac, b)
 	return b, errors.Trace(err)
+}
+
+func valueSizeOfDecimal(dec *types.MyDecimal, precision, frac int) int {
+	if precision == 0 {
+		precision, frac = dec.PrecisionAndFrac()
+	}
+	return types.DecimalBinSize(precision, frac) + 2
 }
 
 // DecodeDecimal decodes bytes to decimal.
 func DecodeDecimal(b []byte) ([]byte, *types.MyDecimal, int, int, error) {
-	// gofail: var errorInDecodeDecimal bool
-	// if errorInDecodeDecimal {
-	//	 return b, nil, 0, 0, errors.New("gofail error")
-	// }
+	failpoint.Inject("errorInDecodeDecimal", func(val failpoint.Value) {
+		if val.(bool) {
+			failpoint.Return(b, nil, 0, 0, errors.New("gofail error"))
+		}
+	})
 
 	if len(b) < 3 {
 		return b, nil, 0, 0, errors.New("insufficient bytes to decode value")

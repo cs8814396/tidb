@@ -24,8 +24,10 @@ import (
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 )
@@ -42,9 +44,13 @@ type testSuite struct {
 
 func (*testSuite) TestT(c *C) {
 	defer testleak.AfterTest(c)()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
+	// Make sure it calls perfschema.Init().
+	dom, err := session.BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer dom.Close()
 
 	handle := infoschema.NewHandle(store)
 	dbName := model.NewCIStr("Test")
@@ -114,17 +120,16 @@ func (*testSuite) TestT(c *C) {
 	txn.Rollback()
 
 	builder.Build()
-
 	is := handle.Get()
 
 	schemaNames := is.AllSchemaNames()
-	c.Assert(schemaNames, HasLen, 3)
-	c.Assert(testutil.CompareUnorderedStringSlice(schemaNames, []string{infoschema.Name, "PERFORMANCE_SCHEMA", "Test"}), IsTrue)
+	c.Assert(schemaNames, HasLen, 4)
+	c.Assert(testutil.CompareUnorderedStringSlice(schemaNames, []string{util.InformationSchemaName.O, util.MetricSchemaName.O, util.PerformanceSchemaName.O, "Test"}), IsTrue)
 
 	schemas := is.AllSchemas()
-	c.Assert(schemas, HasLen, 3)
+	c.Assert(schemas, HasLen, 4)
 	schemas = is.Clone()
-	c.Assert(schemas, HasLen, 3)
+	c.Assert(schemas, HasLen, 4)
 
 	c.Assert(is.SchemaExists(dbName), IsTrue)
 	c.Assert(is.SchemaExists(noexist), IsFalse)
@@ -145,9 +150,19 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(ok, IsFalse)
 	c.Assert(schema, IsNil)
 
+	schema, ok = is.SchemaByTable(tblInfo)
+	c.Assert(ok, IsTrue)
+	c.Assert(schema, NotNil)
+
+	noexistTblInfo := &model.TableInfo{ID: 12345, Name: tblInfo.Name}
+	schema, ok = is.SchemaByTable(noexistTblInfo)
+	c.Assert(ok, IsFalse)
+	c.Assert(schema, IsNil)
+
 	c.Assert(is.TableExists(dbName, tbName), IsTrue)
 	c.Assert(is.TableExists(dbName, noexist), IsFalse)
 	c.Assert(is.TableIsView(dbName, tbName), IsFalse)
+	c.Assert(is.TableIsSequence(dbName, tbName), IsFalse)
 
 	tb, ok := is.TableByID(tbID)
 	c.Assert(ok, IsTrue)
@@ -194,6 +209,32 @@ func (*testSuite) TestT(c *C) {
 	schema, ok = is.SchemaByID(dbID)
 	c.Assert(ok, IsTrue)
 	c.Assert(len(schema.Tables), Equals, 1)
+
+	emptyHandle := handle.EmptyClone()
+	c.Assert(emptyHandle.Get(), IsNil)
+}
+
+func (testSuite) TestMockInfoSchema(c *C) {
+	tblID := int64(1234)
+	tblName := model.NewCIStr("tbl_m")
+	tableInfo := &model.TableInfo{
+		ID:    tblID,
+		Name:  tblName,
+		State: model.StatePublic,
+	}
+	colInfo := &model.ColumnInfo{
+		State:     model.StatePublic,
+		Offset:    0,
+		Name:      model.NewCIStr("h"),
+		FieldType: *types.NewFieldType(mysql.TypeLong),
+		ID:        1,
+	}
+	tableInfo.Columns = []*model.ColumnInfo{colInfo}
+	is := infoschema.MockInfoSchema([]*model.TableInfo{tableInfo})
+	tbl, ok := is.TableByID(tblID)
+	c.Assert(ok, IsTrue)
+	c.Assert(tbl.Meta().Name, Equals, tblName)
+	c.Assert(tbl.Cols()[0].ColumnInfo, Equals, colInfo)
 }
 
 func checkApplyCreateNonExistsSchemaDoesNotPanic(c *C, txn kv.Transaction, builder *infoschema.Builder) {
@@ -214,7 +255,7 @@ func (testSuite) TestConcurrent(c *C) {
 	storeCount := 5
 	stores := make([]kv.Storage, storeCount)
 	for i := 0; i < storeCount; i++ {
-		store, err := mockstore.NewMockTikvStore()
+		store, err := mockstore.NewMockStore()
 		c.Assert(err, IsNil)
 		stores[i] = store
 	}
@@ -237,7 +278,7 @@ func (testSuite) TestConcurrent(c *C) {
 // TestInfoTables makes sure that all tables of information_schema could be found in infoschema handle.
 func (*testSuite) TestInfoTables(c *C) {
 	defer testleak.AfterTest(c)()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
 	handle := infoschema.NewHandle(store)
@@ -281,7 +322,7 @@ func (*testSuite) TestInfoTables(c *C) {
 		"PROCESSLIST",
 	}
 	for _, t := range infoTables {
-		tb, err1 := is.TableByName(model.NewCIStr(infoschema.Name), model.NewCIStr(t))
+		tb, err1 := is.TableByName(util.InformationSchemaName, model.NewCIStr(t))
 		c.Assert(err1, IsNil)
 		c.Assert(tb, NotNil)
 	}

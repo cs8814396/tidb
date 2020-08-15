@@ -17,20 +17,26 @@ import (
 	"context"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/planner"
 	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/types"
 	driver "github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/hint"
 	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pingcap/tidb/util/stringutil"
+	"go.uber.org/zap"
 )
 
 var (
@@ -83,9 +89,11 @@ type PrepareExec struct {
 	Fields     []*ast.ResultField
 }
 
+var prepareStmtLabel = stringutil.StringerStr("PrepareStmt")
+
 // NewPrepareExec creates a new PrepareExec.
 func NewPrepareExec(ctx sessionctx.Context, is infoschema.InfoSchema, sqlTxt string) *PrepareExec {
-	base := newBaseExecutor(ctx, nil, "PrepareStmt")
+	base := newBaseExecutor(ctx, nil, prepareStmtLabel)
 	base.initCap = chunk.ZeroCapacity
 	return &PrepareExec{
 		baseExecutor: base,
@@ -95,7 +103,7 @@ func NewPrepareExec(ctx sessionctx.Context, is infoschema.InfoSchema, sqlTxt str
 }
 
 // Next implements the Executor Next interface.
-func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+func (e *PrepareExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	vars := e.ctx.GetSessionVars()
 	if e.ID != 0 {
 		// Must be the case when we retry a prepare.
@@ -128,15 +136,19 @@ func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 		return ErrPrepareMulti
 	}
 	stmt := stmts[0]
-	if _, ok := stmt.(ast.DDLNode); ok {
-		return ErrPrepareDDL
-	}
+
 	err = ResetContextOfStmt(e.ctx, stmt)
 	if err != nil {
 		return err
 	}
+
 	var extractor paramMarkerExtractor
 	stmt.Accept(&extractor)
+
+	// DDL Statements can not accept parameters
+	if _, ok := stmt.(ast.DDLNode); ok && len(extractor.markers) > 0 {
+		return ErrPrepareDDL
+	}
 
 	// Prepare parameters should NOT over 2 bytes(MaxUint16)
 	// https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK.
@@ -144,9 +156,9 @@ func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 		return ErrPsManyParam
 	}
 
-	err = plannercore.Preprocess(e.ctx, stmt, e.is, true)
+	err = plannercore.Preprocess(e.ctx, stmt, e.is, plannercore.InPrepare)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	// The parameter markers are appended in visiting order, which may not
@@ -160,22 +172,29 @@ func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 	}
 	prepared := &ast.Prepared{
 		Stmt:          stmt,
+		StmtType:      GetStmtLabel(stmt),
 		Params:        sorter.markers,
 		SchemaVersion: e.is.SchemaMetaVersion(),
 	}
-	prepared.UseCache = plannercore.PreparedPlanCacheEnabled() && (vars.LightningMode || plannercore.Cacheable(stmt))
+
+	prepared.UseCache = plannercore.PreparedPlanCacheEnabled() && plannercore.Cacheable(stmt, e.is)
 
 	// We try to build the real statement of preparedStmt.
 	for i := range prepared.Params {
-		prepared.Params[i].(*driver.ParamMarkerExpr).Datum.SetNull()
+		param := prepared.Params[i].(*driver.ParamMarkerExpr)
+		param.Datum.SetNull()
+		param.InExecute = false
 	}
 	var p plannercore.Plan
-	p, err = plannercore.BuildLogicalPlan(e.ctx, stmt, e.is)
+	e.ctx.GetSessionVars().PlanID = 0
+	e.ctx.GetSessionVars().PlanColumnID = 0
+	destBuilder := plannercore.NewPlanBuilder(e.ctx, e.is, &hint.BlockHintProcessor{})
+	p, err = destBuilder.Build(ctx, stmt)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	if _, ok := stmt.(*ast.SelectStmt); ok {
-		e.Fields = schema2ResultFields(p.Schema(), vars.CurrentDB)
+		e.Fields = colNames2ResultFields(p.Schema(), p.OutputNames(), vars.CurrentDB)
 	}
 	if e.ID == 0 {
 		e.ID = vars.GetNextPreparedStmtID()
@@ -183,7 +202,15 @@ func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 	if e.name != "" {
 		vars.PreparedStmtNameToID[e.name] = e.ID
 	}
-	return vars.AddPreparedStmt(e.ID, prepared)
+
+	normalized, digest := parser.NormalizeDigest(prepared.Stmt.Text())
+	preparedObj := &plannercore.CachedPrepareStmt{
+		PreparedAst:   prepared,
+		VisitInfos:    destBuilder.GetVisitInfo(),
+		NormalizedSQL: normalized,
+		SQLDigest:     digest,
+	}
+	return vars.AddPreparedStmt(e.ID, preparedObj)
 }
 
 // ExecuteExec represents an EXECUTE executor.
@@ -192,41 +219,44 @@ func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 type ExecuteExec struct {
 	baseExecutor
 
-	is        infoschema.InfoSchema
-	name      string
-	usingVars []expression.Expression
-	id        uint32
-	stmtExec  Executor
-	stmt      ast.StmtNode
-	plan      plannercore.Plan
+	is            infoschema.InfoSchema
+	name          string
+	usingVars     []expression.Expression
+	stmtExec      Executor
+	stmt          ast.StmtNode
+	plan          plannercore.Plan
+	id            uint32
+	lowerPriority bool
+	outputNames   []*types.FieldName
 }
 
 // Next implements the Executor Next interface.
-func (e *ExecuteExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+func (e *ExecuteExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	return nil
 }
 
 // Build builds a prepared statement into an executor.
 // After Build, e.StmtExec will be used to do the real execution.
-func (e *ExecuteExec) Build() error {
-	ok, err := IsPointGetWithPKOrUniqueKeyByAutoCommit(e.ctx, e.plan)
+func (e *ExecuteExec) Build(b *executorBuilder) error {
+	ok, err := plannercore.IsPointGetWithPKOrUniqueKeyByAutoCommit(e.ctx, e.plan)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	if ok {
 		err = e.ctx.InitTxnWithStartTS(math.MaxUint64)
 	}
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
-	b := newExecutorBuilder(e.ctx, e.is)
 	stmtExec := b.build(e.plan)
 	if b.err != nil {
+		log.Warn("rebuild plan in EXECUTE statement failed", zap.String("labelName of PREPARE statement", e.name))
 		return errors.Trace(b.err)
 	}
 	e.stmtExec = stmtExec
-	CountStmtNode(e.stmt, e.ctx.GetSessionVars().InRestrictedSQL)
-	logExpensiveQuery(e.stmt, e.plan)
+	if e.ctx.GetSessionVars().StmtCtx.Priority == mysql.NoPriority {
+		e.lowerPriority = needLowerPriority(e.plan)
+	}
 	return nil
 }
 
@@ -238,16 +268,22 @@ type DeallocateExec struct {
 }
 
 // Next implements the Executor Next interface.
-func (e *DeallocateExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+func (e *DeallocateExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	vars := e.ctx.GetSessionVars()
 	id, ok := vars.PreparedStmtNameToID[e.Name]
 	if !ok {
 		return errors.Trace(plannercore.ErrStmtNotFound)
 	}
+	preparedPointer := vars.PreparedStmts[id]
+	preparedObj, ok := preparedPointer.(*plannercore.CachedPrepareStmt)
+	if !ok {
+		return errors.Errorf("invalid CachedPrepareStmt type")
+	}
+	prepared := preparedObj.PreparedAst
 	delete(vars.PreparedStmtNameToID, e.Name)
 	if plannercore.PreparedPlanCacheEnabled() {
 		e.ctx.PreparedPlanCache().Delete(plannercore.NewPSTMTPlanCacheKey(
-			vars, id, vars.PreparedStmts[id].SchemaVersion,
+			vars, id, prepared.SchemaVersion,
 		))
 	}
 	vars.RemovePreparedStmt(id)
@@ -255,43 +291,40 @@ func (e *DeallocateExec) Next(ctx context.Context, req *chunk.RecordBatch) error
 }
 
 // CompileExecutePreparedStmt compiles a session Execute command to a stmt.Statement.
-func CompileExecutePreparedStmt(ctx sessionctx.Context, ID uint32, args ...interface{}) (sqlexec.Statement, error) {
+func CompileExecutePreparedStmt(ctx context.Context, sctx sessionctx.Context,
+	ID uint32, args []types.Datum) (sqlexec.Statement, error) {
+	startTime := time.Now()
+	defer func() {
+		sctx.GetSessionVars().DurationCompile = time.Since(startTime)
+	}()
 	execStmt := &ast.ExecuteStmt{ExecID: ID}
-	if err := ResetContextOfStmt(ctx, execStmt); err != nil {
+	if err := ResetContextOfStmt(sctx, execStmt); err != nil {
 		return nil, err
 	}
-	execStmt.UsingVars = make([]ast.ExprNode, len(args))
-	for i, val := range args {
-		execStmt.UsingVars[i] = ast.NewValueExpr(val)
-	}
-	is := GetInfoSchema(ctx)
-	execPlan, err := planner.Optimize(ctx, execStmt, is)
+	execStmt.BinaryArgs = args
+	is := infoschema.GetInfoSchema(sctx)
+	execPlan, names, err := planner.Optimize(ctx, sctx, execStmt, is)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	stmt := &ExecStmt{
-		InfoSchema: GetInfoSchema(ctx),
-		Plan:       execPlan,
-		StmtNode:   execStmt,
-		Ctx:        ctx,
+		GoCtx:       ctx,
+		InfoSchema:  is,
+		Plan:        execPlan,
+		StmtNode:    execStmt,
+		Ctx:         sctx,
+		OutputNames: names,
 	}
-	if prepared, ok := ctx.GetSessionVars().PreparedStmts[ID]; ok {
-		stmt.Text = prepared.Stmt.Text()
+	if preparedPointer, ok := sctx.GetSessionVars().PreparedStmts[ID]; ok {
+		preparedObj, ok := preparedPointer.(*plannercore.CachedPrepareStmt)
+		if !ok {
+			return nil, errors.Errorf("invalid CachedPrepareStmt type")
+		}
+		stmtCtx := sctx.GetSessionVars().StmtCtx
+		stmt.Text = preparedObj.PreparedAst.Stmt.Text()
+		stmtCtx.OriginalSQL = stmt.Text
+		stmtCtx.InitSQLDigest(preparedObj.NormalizedSQL, preparedObj.SQLDigest)
 	}
 	return stmt, nil
-}
-
-func getPreparedStmt(stmt *ast.ExecuteStmt, vars *variable.SessionVars) (ast.StmtNode, error) {
-	var ok bool
-	execID := stmt.ExecID
-	if stmt.Name != "" {
-		if execID, ok = vars.PreparedStmtNameToID[stmt.Name]; !ok {
-			return nil, plannercore.ErrStmtNotFound
-		}
-	}
-	if prepared, ok := vars.PreparedStmts[execID]; ok {
-		return prepared.Stmt, nil
-	}
-	return nil, plannercore.ErrStmtNotFound
 }

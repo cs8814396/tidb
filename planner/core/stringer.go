@@ -14,8 +14,11 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
+
+	"github.com/pingcap/tidb/util/plancodec"
 )
 
 // ToString explains a Plan, returns description string.
@@ -92,9 +95,9 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			id = "MergeInnerJoin"
 		}
 		str = id + "{" + strings.Join(children, "->") + "}"
-		for i := range x.LeftKeys {
-			l := x.LeftKeys[i].String()
-			r := x.RightKeys[i].String()
+		for i := range x.LeftJoinKeys {
+			l := x.LeftJoinKeys[i].String()
+			r := x.RightJoinKeys[i].String()
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
 	case *LogicalApply, *PhysicalApply:
@@ -112,12 +115,10 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = "Lock"
 	case *ShowDDL:
 		str = "ShowDDL"
-	case *Show:
-		if len(x.Conditions) == 0 {
-			str = "Show"
-		} else {
-			str = fmt.Sprintf("Show(%s)", x.Conditions)
-		}
+	case *LogicalShow, *PhysicalShow:
+		str = "Show"
+	case *LogicalShowDDLJobs, *PhysicalShowDDLJobs:
+		str = "ShowDDLJobs"
 	case *LogicalSort, *PhysicalSort:
 		str = "Sort"
 	case *LogicalJoin:
@@ -132,12 +133,16 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			r := eq.GetArgs()[1].String()
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
-	case *LogicalUnionAll, *PhysicalUnionAll:
+	case *LogicalUnionAll, *PhysicalUnionAll, *LogicalPartitionUnionAll:
 		last := len(idxs) - 1
 		idx := idxs[last]
 		children := strs[idx:]
 		strs = strs[:idx]
-		str = "UnionAll{" + strings.Join(children, "->") + "}"
+		name := "UnionAll"
+		if x.TP() == plancodec.TypePartitionUnion {
+			name = "PartitionUnionAll"
+		}
+		str = name + "{" + strings.Join(children, "->") + "}"
 		idxs = idxs[:last]
 	case *DataSource:
 		if x.isPartition {
@@ -180,6 +185,15 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		str = fmt.Sprintf("IndexReader(%s)", ToString(x.indexPlan))
 	case *PhysicalIndexLookUpReader:
 		str = fmt.Sprintf("IndexLookUp(%s, %s)", ToString(x.indexPlan), ToString(x.tablePlan))
+	case *PhysicalIndexMergeReader:
+		str = "IndexMergeReader(PartialPlans->["
+		for i, paritalPlan := range x.partialPlans {
+			if i > 0 {
+				str += ", "
+			}
+			str += ToString(paritalPlan)
+		}
+		str += "], TablePlan->" + ToString(x.tablePlan) + ")"
 	case *PhysicalUnionScan:
 		str = fmt.Sprintf("UnionScan(%s)", x.Conditions)
 	case *PhysicalIndexJoin:
@@ -194,6 +208,30 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			r := x.InnerJoinKeys[i]
 			str += fmt.Sprintf("(%s,%s)", l, r)
 		}
+	case *PhysicalIndexMergeJoin:
+		last := len(idxs) - 1
+		idx := idxs[last]
+		children := strs[idx:]
+		strs = strs[:idx]
+		idxs = idxs[:last]
+		str = "IndexMergeJoin{" + strings.Join(children, "->") + "}"
+		for i := range x.OuterJoinKeys {
+			l := x.OuterJoinKeys[i]
+			r := x.InnerJoinKeys[i]
+			str += fmt.Sprintf("(%s,%s)", l, r)
+		}
+	case *PhysicalIndexHashJoin:
+		last := len(idxs) - 1
+		idx := idxs[last]
+		children := strs[idx:]
+		strs = strs[:idx]
+		idxs = idxs[:last]
+		str = "IndexHashJoin{" + strings.Join(children, "->") + "}"
+		for i := range x.OuterJoinKeys {
+			l := x.OuterJoinKeys[i]
+			r := x.InnerJoinKeys[i]
+			str += fmt.Sprintf("(%s,%s)", l, r)
+		}
 	case *Analyze:
 		str = "Analyze{"
 		var children []string
@@ -202,8 +240,8 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 		}
 		for _, col := range x.ColTasks {
 			var colNames []string
-			if col.PKInfo != nil {
-				colNames = append(colNames, col.PKInfo.Name.O)
+			if col.HandleCols != nil {
+				colNames = append(colNames, col.HandleCols.String())
 			}
 			for _, c := range col.ColsInfo {
 				colNames = append(colNames, c.Name.O)
@@ -221,9 +259,29 @@ func toString(in Plan, strs []string, idxs []int) ([]string, []int) {
 			str = fmt.Sprintf("%s->Insert", ToString(x.SelectPlan))
 		}
 	case *LogicalWindow:
-		str = fmt.Sprintf("Window(%s)", x.WindowFuncDesc.String())
+		buffer := bytes.NewBufferString("")
+		formatWindowFuncDescs(buffer, x.WindowFuncDescs, x.schema)
+		str = fmt.Sprintf("Window(%s)", buffer.String())
 	case *PhysicalWindow:
-		str = fmt.Sprintf("Window(%s)", x.WindowFuncDesc.String())
+		str = fmt.Sprintf("Window(%s)", x.ExplainInfo())
+	case *PhysicalShuffle:
+		str = fmt.Sprintf("Partition(%s)", x.ExplainInfo())
+	case *PhysicalShuffleDataSourceStub:
+		str = fmt.Sprintf("PartitionDataSourceStub(%s)", x.ExplainInfo())
+	case *PointGetPlan:
+		str = fmt.Sprintf("PointGet(")
+		if x.IndexInfo != nil {
+			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
+		} else {
+			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handle)
+		}
+	case *BatchPointGetPlan:
+		str = fmt.Sprintf("BatchPointGet(")
+		if x.IndexInfo != nil {
+			str += fmt.Sprintf("Index(%s.%s)%v)", x.TblInfo.Name.L, x.IndexInfo.Name.L, x.IndexValues)
+		} else {
+			str += fmt.Sprintf("Handle(%s.%s)%v)", x.TblInfo.Name.L, x.TblInfo.GetPkName().L, x.Handles)
+		}
 	default:
 		str = fmt.Sprintf("%T", in)
 	}

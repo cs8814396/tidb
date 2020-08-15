@@ -18,16 +18,23 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/disk"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/ranger"
+	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tipb/go-tipb"
 )
@@ -37,9 +44,7 @@ var _ = Suite(&testSuite{})
 func TestT(t *testing.T) {
 	CustomVerboseFlag = true
 	logLevel := os.Getenv("log_level")
-	logutil.InitLogger(&logutil.LogConfig{
-		Level: logLevel,
-	})
+	logutil.InitLogger(logutil.NewLogConfig(logLevel, logutil.DefaultLogFormat, "", logutil.EmptyFileLogConfig, false))
 	TestingT(t)
 }
 
@@ -51,9 +56,17 @@ type testSuite struct {
 
 func (s *testSuite) SetUpSuite(c *C) {
 	ctx := mock.NewContext()
+	ctx.GetSessionVars().StmtCtx = &stmtctx.StatementContext{
+		MemTracker:  memory.NewTracker(stringutil.StringerStr("testSuite"), -1),
+		DiskTracker: disk.NewTracker(stringutil.StringerStr("testSuite"), -1),
+	}
 	ctx.Store = &mock.Store{
 		Client: &mock.Client{
-			MockResponse: &mockResponse{},
+			MockResponse: &mockResponse{
+				ctx:   ctx,
+				batch: 1,
+				total: 2,
+			},
 		},
 	}
 	s.sctx = ctx
@@ -67,7 +80,11 @@ func (s *testSuite) SetUpTest(c *C) {
 	ctx := s.sctx.(*mock.Context)
 	store := ctx.Store.(*mock.Store)
 	store.Client = &mock.Client{
-		MockResponse: &mockResponse{},
+		MockResponse: &mockResponse{
+			ctx:   ctx,
+			batch: 1,
+			total: 2,
+		},
 	}
 }
 
@@ -85,7 +102,7 @@ func (s *testSuite) getExpectedRanges(tid int64, hrs []*handleRange) []kv.KeyRan
 	for _, hr := range hrs {
 		low := codec.EncodeInt(nil, hr.start)
 		high := codec.EncodeInt(nil, hr.end)
-		high = []byte(kv.Key(high).PrefixNext())
+		high = kv.Key(high).PrefixNext()
 		startKey := tablecodec.EncodeRowKey(tid, low)
 		endKey := tablecodec.EncodeRowKey(tid, high)
 		krs = append(krs, kv.KeyRange{StartKey: startKey, EndKey: endKey})
@@ -94,7 +111,8 @@ func (s *testSuite) getExpectedRanges(tid int64, hrs []*handleRange) []kv.KeyRan
 }
 
 func (s *testSuite) TestTableHandlesToKVRanges(c *C) {
-	handles := []int64{0, 2, 3, 4, 5, 10, 11, 100, 9223372036854775806, 9223372036854775807}
+	handles := []kv.Handle{kv.IntHandle(0), kv.IntHandle(2), kv.IntHandle(3), kv.IntHandle(4), kv.IntHandle(5),
+		kv.IntHandle(10), kv.IntHandle(11), kv.IntHandle(100), kv.IntHandle(9223372036854775806), kv.IntHandle(9223372036854775807)}
 
 	// Build expected key ranges.
 	hrs := make([]*handleRange, 0, len(handles))
@@ -271,7 +289,7 @@ func (s *testSuite) TestRequestBuilder1(c *C) {
 	expect := &kv.Request{
 		Tp:      103,
 		StartTs: 0x0,
-		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
+		Data:    []uint8{0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges: []kv.KeyRange{
 			{
 				StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -294,14 +312,16 @@ func (s *testSuite) TestRequestBuilder1(c *C) {
 				EndKey:   kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x23},
 			},
 		},
+		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		NotFillCache:   false,
 		SyncLog:        false,
 		Streaming:      false,
+		ReplicaRead:    kv.ReplicaReadLeader,
 	}
 	c.Assert(actual, DeepEquals, expect)
 }
@@ -345,7 +365,7 @@ func (s *testSuite) TestRequestBuilder2(c *C) {
 	expect := &kv.Request{
 		Tp:      103,
 		StartTs: 0x0,
-		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
+		Data:    []uint8{0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges: []kv.KeyRange{
 			{
 				StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x5f, 0x69, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -368,20 +388,23 @@ func (s *testSuite) TestRequestBuilder2(c *C) {
 				EndKey:   kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc, 0x5f, 0x69, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x23},
 			},
 		},
+		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		NotFillCache:   false,
 		SyncLog:        false,
 		Streaming:      false,
+		ReplicaRead:    kv.ReplicaReadLeader,
 	}
 	c.Assert(actual, DeepEquals, expect)
 }
 
 func (s *testSuite) TestRequestBuilder3(c *C) {
-	handles := []int64{0, 2, 3, 4, 5, 10, 11, 100}
+	handles := []kv.Handle{kv.IntHandle(0), kv.IntHandle(2), kv.IntHandle(3), kv.IntHandle(4),
+		kv.IntHandle(5), kv.IntHandle(10), kv.IntHandle(11), kv.IntHandle(100)}
 
 	actual, err := (&RequestBuilder{}).SetTableHandles(15, handles).
 		SetDAGRequest(&tipb.DAGRequest{}).
@@ -393,7 +416,7 @@ func (s *testSuite) TestRequestBuilder3(c *C) {
 	expect := &kv.Request{
 		Tp:      103,
 		StartTs: 0x0,
-		Data:    []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
+		Data:    []uint8{0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges: []kv.KeyRange{
 			{
 				StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
@@ -412,14 +435,16 @@ func (s *testSuite) TestRequestBuilder3(c *C) {
 				EndKey:   kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xf, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x65},
 			},
 		},
+		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		NotFillCache:   false,
 		SyncLog:        false,
 		Streaming:      false,
+		ReplicaRead:    kv.ReplicaReadLeader,
 	}
 	c.Assert(actual, DeepEquals, expect)
 }
@@ -455,16 +480,18 @@ func (s *testSuite) TestRequestBuilder4(c *C) {
 	expect := &kv.Request{
 		Tp:             103,
 		StartTs:        0x0,
-		Data:           []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
+		Data:           []uint8{0x18, 0x0, 0x20, 0x0, 0x40, 0x0, 0x5a, 0x0},
 		KeyRanges:      keyRanges,
+		Cacheable:      true,
 		KeepOrder:      false,
 		Desc:           false,
-		Concurrency:    15,
+		Concurrency:    variable.DefDistSQLScanConcurrency,
 		IsolationLevel: 0,
 		Priority:       0,
 		Streaming:      true,
 		NotFillCache:   false,
 		SyncLog:        false,
+		ReplicaRead:    kv.ReplicaReadLeader,
 	}
 	c.Assert(actual, DeepEquals, expect)
 }
@@ -498,7 +525,7 @@ func (s *testSuite) TestRequestBuilder5(c *C) {
 	expect := &kv.Request{
 		Tp:             104,
 		StartTs:        0x0,
-		Data:           []uint8{0x8, 0x0, 0x10, 0x0, 0x18, 0x0, 0x20, 0x0},
+		Data:           []uint8{0x8, 0x0, 0x18, 0x0, 0x20, 0x0},
 		KeyRanges:      keyRanges,
 		KeepOrder:      true,
 		Desc:           false,
@@ -531,7 +558,7 @@ func (s *testSuite) TestRequestBuilder6(c *C) {
 	expect := &kv.Request{
 		Tp:             105,
 		StartTs:        0x0,
-		Data:           []uint8{0x8, 0x0, 0x10, 0x0, 0x18, 0x0},
+		Data:           []uint8{0x10, 0x0, 0x18, 0x0},
 		KeyRanges:      keyRanges,
 		KeepOrder:      false,
 		Desc:           false,
@@ -544,4 +571,115 @@ func (s *testSuite) TestRequestBuilder6(c *C) {
 	}
 
 	c.Assert(actual, DeepEquals, expect)
+}
+
+func (s *testSuite) TestRequestBuilder7(c *C) {
+	vars := variable.NewSessionVars()
+	vars.SetReplicaRead(kv.ReplicaReadFollower)
+
+	concurrency := 10
+
+	actual, err := (&RequestBuilder{}).
+		SetFromSessionVars(vars).
+		SetConcurrency(concurrency).
+		Build()
+	c.Assert(err, IsNil)
+
+	expect := &kv.Request{
+		Tp:             0,
+		StartTs:        0x0,
+		KeepOrder:      false,
+		Desc:           false,
+		Concurrency:    concurrency,
+		IsolationLevel: 0,
+		Priority:       0,
+		NotFillCache:   false,
+		SyncLog:        false,
+		Streaming:      false,
+		ReplicaRead:    kv.ReplicaReadFollower,
+	}
+
+	c.Assert(actual, DeepEquals, expect)
+}
+
+func (s *testSuite) TestRequestBuilder8(c *C) {
+	sv := variable.NewSessionVars()
+	sv.SnapshotInfoschema = infoschema.MockInfoSchemaWithSchemaVer(nil, 10000)
+	actual, err := (&RequestBuilder{}).
+		SetFromSessionVars(sv).
+		Build()
+	c.Assert(err, IsNil)
+	expect := &kv.Request{
+		Tp:             0,
+		StartTs:        0x0,
+		Data:           []uint8(nil),
+		Concurrency:    variable.DefDistSQLScanConcurrency,
+		IsolationLevel: 0,
+		Priority:       0,
+		MemTracker:     (*memory.Tracker)(nil),
+		ReplicaRead:    0x1,
+		SchemaVar:      10000,
+	}
+	c.Assert(actual, DeepEquals, expect)
+}
+
+func (s *testSuite) TestTableRangesToKVRangesWithFbs(c *C) {
+	ranges := []*ranger.Range{
+		{
+			LowVal:  []types.Datum{types.NewIntDatum(1)},
+			HighVal: []types.Datum{types.NewIntDatum(4)},
+		},
+	}
+	hist := statistics.NewHistogram(1, 30, 30, 0, types.NewFieldType(mysql.TypeLonglong), chunk.InitialCapacity, 0)
+	for i := 0; i < 10; i++ {
+		hist.Bounds.AppendInt64(0, int64(i))
+		hist.Bounds.AppendInt64(0, int64(i+2))
+		hist.Buckets = append(hist.Buckets, statistics.Bucket{Repeat: 10, Count: int64(i + 30)})
+	}
+	fb := statistics.NewQueryFeedback(0, hist, 0, false)
+	lower, upper := types.NewIntDatum(2), types.NewIntDatum(3)
+	fb.Feedback = []statistics.Feedback{
+		{Lower: &lower, Upper: &upper, Count: 1, Repeat: 1},
+	}
+	actual := TableRangesToKVRanges(0, ranges, fb)
+	expect := []kv.KeyRange{
+		{
+			StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			EndKey:   kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5f, 0x72, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5},
+		},
+	}
+	for i := 0; i < len(actual); i++ {
+		c.Assert(actual[i], DeepEquals, expect[i])
+	}
+}
+
+func (s *testSuite) TestIndexRangesToKVRangesWithFbs(c *C) {
+	ranges := []*ranger.Range{
+		{
+			LowVal:  []types.Datum{types.NewIntDatum(1)},
+			HighVal: []types.Datum{types.NewIntDatum(4)},
+		},
+	}
+	hist := statistics.NewHistogram(1, 30, 30, 0, types.NewFieldType(mysql.TypeLonglong), chunk.InitialCapacity, 0)
+	for i := 0; i < 10; i++ {
+		hist.Bounds.AppendInt64(0, int64(i))
+		hist.Bounds.AppendInt64(0, int64(i+2))
+		hist.Buckets = append(hist.Buckets, statistics.Bucket{Repeat: 10, Count: int64(i + 30)})
+	}
+	fb := statistics.NewQueryFeedback(0, hist, 0, false)
+	lower, upper := types.NewIntDatum(2), types.NewIntDatum(3)
+	fb.Feedback = []statistics.Feedback{
+		{Lower: &lower, Upper: &upper, Count: 1, Repeat: 1},
+	}
+	actual, err := IndexRangesToKVRanges(new(stmtctx.StatementContext), 0, 0, ranges, fb)
+	c.Assert(err, IsNil)
+	expect := []kv.KeyRange{
+		{
+			StartKey: kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5f, 0x69, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			EndKey:   kv.Key{0x74, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5f, 0x69, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x3, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5},
+		},
+	}
+	for i := 0; i < len(actual); i++ {
+		c.Assert(actual[i], DeepEquals, expect[i])
+	}
 }

@@ -34,10 +34,13 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/collate"
 	mockpkg "github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/util/rowcodec"
 	"github.com/pingcap/tidb/util/timeutil"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -47,6 +50,7 @@ var dummySlice = make([]byte, 0)
 type dagContext struct {
 	dagReq    *tipb.DAGRequest
 	keyRanges []*coprocessor.KeyRange
+	startTS   uint64
 	evalCtx   *evalContext
 }
 
@@ -56,16 +60,13 @@ func (h *rpcHandler) handleCopDAGRequest(req *coprocessor.Request) *coprocessor.
 		resp.RegionError = err
 		return resp
 	}
-	dagCtx, e, dagReq, err := h.buildDAGExecutor(req)
+	dagCtx, e, dagReq, err := h.buildDAGExecutor(req, false)
 	if err != nil {
 		resp.OtherError = err.Error()
 		return resp
 	}
 
-	var (
-		chunks []tipb.Chunk
-		rowCnt int
-	)
+	var rows [][][]byte
 	ctx := context.TODO()
 	for {
 		var row [][]byte
@@ -76,18 +77,22 @@ func (h *rpcHandler) handleCopDAGRequest(req *coprocessor.Request) *coprocessor.
 		if row == nil {
 			break
 		}
-		data := dummySlice
-		for _, offset := range dagReq.OutputOffsets {
-			data = append(data, row[offset]...)
-		}
-		chunks = appendRow(chunks, data, rowCnt)
-		rowCnt++
+		rows = append(rows, row)
 	}
-	warnings := dagCtx.evalCtx.sc.GetWarnings()
-	return buildResp(chunks, e.Counts(), err, warnings)
+
+	var execDetails []*execDetail
+	if dagReq.CollectExecutionSummaries != nil && *dagReq.CollectExecutionSummaries {
+		execDetails = e.ExecDetails()
+	}
+
+	selResp := h.initSelectResponse(err, dagCtx.evalCtx.sc.GetWarnings(), e.Counts())
+	if err == nil {
+		err = h.fillUpData4SelectResponse(selResp, dagReq, dagCtx, rows)
+	}
+	return buildResp(selResp, execDetails, err)
 }
 
-func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, executor, *tipb.DAGRequest, error) {
+func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request, batchCop bool) (*dagContext, executor, *tipb.DAGRequest, error) {
 	if len(req.Ranges) == 0 {
 		return nil, nil, nil, errors.New("request range is null")
 	}
@@ -110,9 +115,15 @@ func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, ex
 	ctx := &dagContext{
 		dagReq:    dagReq,
 		keyRanges: req.Ranges,
+		startTS:   req.StartTs,
 		evalCtx:   &evalContext{sc: sc},
 	}
-	e, err := h.buildDAG(ctx, dagReq.Executors)
+	var e executor
+	if batchCop {
+		e, err = h.buildDAGForTiFlash(ctx, dagReq.RootExecutor)
+	} else {
+		e, err = h.buildDAG(ctx, dagReq.Executors)
+	}
 	if err != nil {
 		return nil, nil, nil, errors.Trace(err)
 	}
@@ -123,15 +134,11 @@ func (h *rpcHandler) buildDAGExecutor(req *coprocessor.Request) (*dagContext, ex
 // is set, the daylight saving problem must be considered. Otherwise the
 // timezone offset in seconds east of UTC is used to constructed the timezone.
 func constructTimeZone(name string, offset int) (*time.Location, error) {
-	if name != "" {
-		return timeutil.LoadLocation(name)
-	}
-
-	return time.FixedZone("", offset), nil
+	return timeutil.ConstructTimeZone(name, offset)
 }
 
 func (h *rpcHandler) handleCopStream(ctx context.Context, req *coprocessor.Request) (tikvpb.Tikv_CoprocessorStreamClient, error) {
-	dagCtx, e, dagReq, err := h.buildDAGExecutor(req)
+	dagCtx, e, dagReq, err := h.buildDAGExecutor(req, false)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -144,9 +151,10 @@ func (h *rpcHandler) handleCopStream(ctx context.Context, req *coprocessor.Reque
 	}, nil
 }
 
-func (h *rpcHandler) buildExec(ctx *dagContext, curr *tipb.Executor) (executor, error) {
+func (h *rpcHandler) buildExec(ctx *dagContext, curr *tipb.Executor) (executor, *tipb.Executor, error) {
 	var currExec executor
 	var err error
+	var childExec *tipb.Executor
 	switch curr.GetTp() {
 	case tipb.ExecType_TypeTableScan:
 		currExec, err = h.buildTableScan(ctx, curr)
@@ -154,26 +162,46 @@ func (h *rpcHandler) buildExec(ctx *dagContext, curr *tipb.Executor) (executor, 
 		currExec, err = h.buildIndexScan(ctx, curr)
 	case tipb.ExecType_TypeSelection:
 		currExec, err = h.buildSelection(ctx, curr)
+		childExec = curr.Selection.Child
 	case tipb.ExecType_TypeAggregation:
 		currExec, err = h.buildHashAgg(ctx, curr)
+		childExec = curr.Aggregation.Child
 	case tipb.ExecType_TypeStreamAgg:
 		currExec, err = h.buildStreamAgg(ctx, curr)
+		childExec = curr.Aggregation.Child
 	case tipb.ExecType_TypeTopN:
 		currExec, err = h.buildTopN(ctx, curr)
+		childExec = curr.TopN.Child
 	case tipb.ExecType_TypeLimit:
-		currExec = &limitExec{limit: curr.Limit.GetLimit()}
+		currExec = &limitExec{limit: curr.Limit.GetLimit(), execDetail: new(execDetail)}
+		childExec = curr.Limit.Child
 	default:
 		// TODO: Support other types.
 		err = errors.Errorf("this exec type %v doesn't support yet.", curr.GetTp())
 	}
 
-	return currExec, errors.Trace(err)
+	return currExec, childExec, errors.Trace(err)
+}
+
+func (h *rpcHandler) buildDAGForTiFlash(ctx *dagContext, farther *tipb.Executor) (executor, error) {
+	curr, child, err := h.buildExec(ctx, farther)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if child != nil {
+		childExec, err := h.buildDAGForTiFlash(ctx, child)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		curr.SetSrcExec(childExec)
+	}
+	return curr, nil
 }
 
 func (h *rpcHandler) buildDAG(ctx *dagContext, executors []*tipb.Executor) (executor, error) {
 	var src executor
 	for i := 0; i < len(executors); i++ {
-		curr, err := h.buildExec(ctx, executors[i])
+		curr, _, err := h.buildExec(ctx, executors[i])
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -191,14 +219,43 @@ func (h *rpcHandler) buildTableScan(ctx *dagContext, executor *tipb.Executor) (*
 		return nil, errors.Trace(err)
 	}
 
+	startTS := ctx.startTS
+	if startTS == 0 {
+		startTS = ctx.dagReq.GetStartTsFallback()
+	}
+	colInfos := make([]rowcodec.ColInfo, len(columns))
+	for i := range colInfos {
+		col := columns[i]
+		colInfos[i] = rowcodec.ColInfo{
+			ID:         col.ColumnId,
+			Ft:         ctx.evalCtx.fieldTps[i],
+			IsPKHandle: col.GetPkHandle(),
+		}
+	}
+	defVal := func(i int) ([]byte, error) {
+		col := columns[i]
+		if col.DefaultVal == nil {
+			return nil, nil
+		}
+		// col.DefaultVal always be  varint `[flag]+[value]`.
+		if len(col.DefaultVal) < 1 {
+			panic("invalid default value")
+		}
+		return col.DefaultVal, nil
+	}
+	rd := rowcodec.NewByteDecoder(colInfos, []int64{-1}, defVal, nil)
 	e := &tableScanExec{
 		TableScan:      executor.TblScan,
 		kvRanges:       ranges,
 		colIDs:         ctx.evalCtx.colIDs,
-		startTS:        ctx.dagReq.GetStartTs(),
+		startTS:        startTS,
 		isolationLevel: h.isolationLevel,
+		resolvedLocks:  h.resolvedLocks,
 		mvccStore:      h.mvccStore,
+		execDetail:     new(execDetail),
+		rd:             rd,
 	}
+
 	if ctx.dagReq.CollectRangeCounts != nil && *ctx.dagReq.CollectRangeCounts {
 		e.counts = make([]int64, len(ranges))
 	}
@@ -210,17 +267,16 @@ func (h *rpcHandler) buildIndexScan(ctx *dagContext, executor *tipb.Executor) (*
 	columns := executor.IdxScan.Columns
 	ctx.evalCtx.setColumnInfo(columns)
 	length := len(columns)
-	pkStatus := pkColNotExists
+	hdStatus := tablecodec.HandleNotNeeded
 	// The PKHandle column info has been collected in ctx.
 	if columns[length-1].GetPkHandle() {
 		if mysql.HasUnsignedFlag(uint(columns[length-1].GetFlag())) {
-			pkStatus = pkColIsUnsigned
+			hdStatus = tablecodec.HandleIsUnsigned
 		} else {
-			pkStatus = pkColIsSigned
+			hdStatus = tablecodec.HandleDefault
 		}
 		columns = columns[:length-1]
 	} else if columns[length-1].ColumnId == model.ExtraHandleID {
-		pkStatus = pkColIsSigned
 		columns = columns[:length-1]
 	}
 	ranges, err := h.extractKVRanges(ctx.keyRanges, executor.IdxScan.Desc)
@@ -228,14 +284,30 @@ func (h *rpcHandler) buildIndexScan(ctx *dagContext, executor *tipb.Executor) (*
 		return nil, errors.Trace(err)
 	}
 
+	startTS := ctx.startTS
+	if startTS == 0 {
+		startTS = ctx.dagReq.GetStartTsFallback()
+	}
+	colInfos := make([]rowcodec.ColInfo, 0, len(columns))
+	for i := range columns {
+		col := columns[i]
+		colInfos = append(colInfos, rowcodec.ColInfo{
+			ID:         col.ColumnId,
+			Ft:         ctx.evalCtx.fieldTps[i],
+			IsPKHandle: col.GetPkHandle(),
+		})
+	}
 	e := &indexScanExec{
 		IndexScan:      executor.IdxScan,
 		kvRanges:       ranges,
 		colsLen:        len(columns),
-		startTS:        ctx.dagReq.GetStartTs(),
+		startTS:        startTS,
 		isolationLevel: h.isolationLevel,
+		resolvedLocks:  h.resolvedLocks,
 		mvccStore:      h.mvccStore,
-		pkStatus:       pkStatus,
+		hdStatus:       hdStatus,
+		execDetail:     new(execDetail),
+		colInfos:       colInfos,
 	}
 	if ctx.dagReq.CollectRangeCounts != nil && *ctx.dagReq.CollectRangeCounts {
 		e.counts = make([]int64, len(ranges))
@@ -263,6 +335,7 @@ func (h *rpcHandler) buildSelection(ctx *dagContext, executor *tipb.Executor) (*
 		relatedColOffsets: relatedColOffsets,
 		conditions:        conds,
 		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+		execDetail:        new(execDetail),
 	}, nil
 }
 
@@ -311,6 +384,7 @@ func (h *rpcHandler) buildHashAgg(ctx *dagContext, executor *tipb.Executor) (*ha
 		groupKeys:         make([][]byte, 0),
 		relatedColOffsets: relatedColOffsets,
 		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+		execDetail:        new(execDetail),
 	}, nil
 }
 
@@ -332,6 +406,7 @@ func (h *rpcHandler) buildStreamAgg(ctx *dagContext, executor *tipb.Executor) (*
 		currGroupByValues: make([][]byte, 0),
 		relatedColOffsets: relatedColOffsets,
 		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+		execDetail:        new(execDetail),
 	}, nil
 }
 
@@ -366,6 +441,7 @@ func (h *rpcHandler) buildTopN(ctx *dagContext, executor *tipb.Executor) (*topNE
 		relatedColOffsets: relatedColOffsets,
 		orderByExprs:      conds,
 		row:               make([]types.Datum, len(ctx.evalCtx.columnInfos)),
+		execDetail:        new(execDetail),
 	}, nil
 }
 
@@ -380,7 +456,7 @@ func (e *evalContext) setColumnInfo(cols []*tipb.ColumnInfo) {
 	e.columnInfos = make([]*tipb.ColumnInfo, len(cols))
 	copy(e.columnInfos, cols)
 
-	e.colIDs = make(map[int64]int)
+	e.colIDs = make(map[int64]int, len(e.columnInfos))
 	e.fieldTps = make([]*types.FieldType, 0, len(e.columnInfos))
 	for i, col := range e.columnInfos {
 		ft := fieldTypeFromPBColumn(col)
@@ -406,7 +482,13 @@ func flagsToStatementContext(flags uint64) *stmtctx.StatementContext {
 	sc := new(stmtctx.StatementContext)
 	sc.IgnoreTruncate = (flags & model.FlagIgnoreTruncate) > 0
 	sc.TruncateAsWarning = (flags & model.FlagTruncateAsWarning) > 0
-	sc.PadCharToFullLength = (flags & model.FlagPadCharToFullLength) > 0
+	sc.InInsertStmt = (flags & model.FlagInInsertStmt) > 0
+	sc.InSelectStmt = (flags & model.FlagInSelectStmt) > 0
+	sc.InDeleteStmt = (flags & model.FlagInUpdateOrDeleteStmt) > 0
+	sc.OverflowAsWarning = (flags & model.FlagOverflowAsWarning) > 0
+	sc.IgnoreZeroInDate = (flags & model.FlagIgnoreZeroInDate) > 0
+	sc.DividedByZeroAsWarning = (flags & model.FlagDividedByZeroAsWarning) > 0
+	// TODO set FlagInSetOprStmt,
 	return sc
 }
 
@@ -418,12 +500,23 @@ func MockGRPCClientStream() grpc.ClientStream {
 // mockClientStream implements grpc ClientStream interface, its methods are never called.
 type mockClientStream struct{}
 
+// Header implements grpc.ClientStream interface
 func (mockClientStream) Header() (metadata.MD, error) { return nil, nil }
-func (mockClientStream) Trailer() metadata.MD         { return nil }
-func (mockClientStream) CloseSend() error             { return nil }
-func (mockClientStream) Context() context.Context     { return nil }
-func (mockClientStream) SendMsg(m interface{}) error  { return nil }
-func (mockClientStream) RecvMsg(m interface{}) error  { return nil }
+
+// Trailer implements grpc.ClientStream interface
+func (mockClientStream) Trailer() metadata.MD { return nil }
+
+// CloseSend implements grpc.ClientStream interface
+func (mockClientStream) CloseSend() error { return nil }
+
+// Context implements grpc.ClientStream interface
+func (mockClientStream) Context() context.Context { return nil }
+
+// SendMsg implements grpc.ClientStream interface
+func (mockClientStream) SendMsg(m interface{}) error { return nil }
+
+// RecvMsg implements grpc.ClientStream interface
+func (mockClientStream) RecvMsg(m interface{}) error { return nil }
 
 type mockCopStreamClient struct {
 	mockClientStream
@@ -433,6 +526,42 @@ type mockCopStreamClient struct {
 	ctx      context.Context
 	dagCtx   *dagContext
 	finished bool
+}
+
+type mockBathCopErrClient struct {
+	mockClientStream
+
+	*errorpb.Error
+}
+
+func (mock *mockBathCopErrClient) Recv() (*coprocessor.BatchResponse, error) {
+	return &coprocessor.BatchResponse{
+		OtherError: mock.Error.Message,
+	}, nil
+}
+
+type mockBatchCopDataClient struct {
+	mockClientStream
+
+	chunks []tipb.Chunk
+	idx    int
+}
+
+func (mock *mockBatchCopDataClient) Recv() (*coprocessor.BatchResponse, error) {
+	if mock.idx < len(mock.chunks) {
+		res := tipb.SelectResponse{
+			Chunks: []tipb.Chunk{mock.chunks[mock.idx]},
+		}
+		raw, err := res.Marshal()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		mock.idx++
+		return &coprocessor.BatchResponse{
+			Data: raw,
+		}, nil
+	}
+	return nil, io.EOF
 }
 
 type mockCopStreamErrClient struct {
@@ -496,16 +625,10 @@ func (mock *mockCopStreamClient) Recv() (*coprocessor.Response, error) {
 		}
 	}
 	streamResponse := tipb.StreamResponse{
-		Error:    toPBError(err),
-		Data:     data,
-		Warnings: Warnings,
-	}
-	// The counts was the output count of each executor, but now it is the scan count of each range,
-	// so we need a flag to tell them apart.
-	if counts != nil {
-		streamResponse.OutputCounts = make([]int64, 1+len(counts))
-		copy(streamResponse.OutputCounts, counts)
-		streamResponse.OutputCounts[len(counts)] = -1
+		Error:        toPBError(err),
+		Data:         data,
+		Warnings:     Warnings,
+		OutputCounts: counts,
 	}
 	resp.Data, err = proto.Marshal(&streamResponse)
 	if err != nil {
@@ -545,29 +668,129 @@ func (mock *mockCopStreamClient) readBlockFromExecutor() (tipb.Chunk, bool, *cop
 	return chunk, finish, &ran, mock.exec.Counts(), warnings, nil
 }
 
-func buildResp(chunks []tipb.Chunk, counts []int64, err error, warnings []stmtctx.SQLWarn) *coprocessor.Response {
-	resp := &coprocessor.Response{}
+func (h *rpcHandler) initSelectResponse(err error, warnings []stmtctx.SQLWarn, counts []int64) *tipb.SelectResponse {
 	selResp := &tipb.SelectResponse{
 		Error:        toPBError(err),
-		Chunks:       chunks,
 		OutputCounts: counts,
 	}
-	if len(warnings) > 0 {
-		selResp.Warnings = make([]*tipb.Error, 0, len(warnings))
-		for i := range warnings {
-			selResp.Warnings = append(selResp.Warnings, toPBError(warnings[i].Err))
+	for i := range warnings {
+		selResp.Warnings = append(selResp.Warnings, toPBError(warnings[i].Err))
+	}
+	return selResp
+}
+
+func (h *rpcHandler) fillUpData4SelectResponse(selResp *tipb.SelectResponse, dagReq *tipb.DAGRequest, dagCtx *dagContext, rows [][][]byte) error {
+	switch dagReq.EncodeType {
+	case tipb.EncodeType_TypeDefault:
+		h.encodeDefault(selResp, rows, dagReq.OutputOffsets)
+	case tipb.EncodeType_TypeChunk:
+		colTypes := h.constructRespSchema(dagCtx)
+		loc := dagCtx.evalCtx.sc.TimeZone
+		err := h.encodeChunk(selResp, rows, colTypes, dagReq.OutputOffsets, loc)
+		if err != nil {
+			return err
 		}
 	}
-	if err != nil {
-		if locked, ok := errors.Cause(err).(*ErrLocked); ok {
-			resp.Locked = &kvrpcpb.LockInfo{
-				Key:         locked.Key,
-				PrimaryLock: locked.Primary,
-				LockVersion: locked.StartTS,
-				LockTtl:     locked.TTL,
+	return nil
+}
+
+func (h *rpcHandler) constructRespSchema(dagCtx *dagContext) []*types.FieldType {
+	root := dagCtx.dagReq.Executors[len(dagCtx.dagReq.Executors)-1]
+	agg := root.Aggregation
+	if root.StreamAgg != nil {
+		agg = root.StreamAgg
+	}
+	if agg == nil {
+		return dagCtx.evalCtx.fieldTps
+	}
+
+	schema := make([]*types.FieldType, 0, len(agg.AggFunc)+len(agg.GroupBy))
+	for i := range agg.AggFunc {
+		if agg.AggFunc[i].Tp == tipb.ExprType_Avg {
+			// Avg function requests two columns : Count , Sum
+			// This line addend the Count(TypeLonglong) to the schema.
+			schema = append(schema, types.NewFieldType(mysql.TypeLonglong))
+		}
+		schema = append(schema, expression.PbTypeToFieldType(agg.AggFunc[i].FieldType))
+	}
+	for i := range agg.GroupBy {
+		schema = append(schema, expression.PbTypeToFieldType(agg.GroupBy[i].FieldType))
+	}
+	return schema
+}
+
+func (h *rpcHandler) encodeDefault(selResp *tipb.SelectResponse, rows [][][]byte, colOrdinal []uint32) {
+	var chunks []tipb.Chunk
+	for i := range rows {
+		requestedRow := dummySlice
+		for _, ordinal := range colOrdinal {
+			requestedRow = append(requestedRow, rows[i][ordinal]...)
+		}
+		chunks = appendRow(chunks, requestedRow, i)
+	}
+	selResp.Chunks = chunks
+	selResp.EncodeType = tipb.EncodeType_TypeDefault
+}
+
+func (h *rpcHandler) encodeChunk(selResp *tipb.SelectResponse, rows [][][]byte, colTypes []*types.FieldType, colOrdinal []uint32, loc *time.Location) error {
+	var chunks []tipb.Chunk
+	respColTypes := make([]*types.FieldType, 0, len(colOrdinal))
+	for _, ordinal := range colOrdinal {
+		respColTypes = append(respColTypes, colTypes[ordinal])
+	}
+	chk := chunk.NewChunkWithCapacity(respColTypes, rowsPerChunk)
+	encoder := chunk.NewCodec(respColTypes)
+	decoder := codec.NewDecoder(chk, loc)
+	for i := range rows {
+		for j, ordinal := range colOrdinal {
+			_, err := decoder.DecodeOne(rows[i][ordinal], j, colTypes[ordinal])
+			if err != nil {
+				return err
 			}
-		} else {
-			resp.OtherError = err.Error()
+		}
+		if i%rowsPerChunk == rowsPerChunk-1 {
+			chunks = append(chunks, tipb.Chunk{})
+			cur := &chunks[len(chunks)-1]
+			cur.RowsData = append(cur.RowsData, encoder.Encode(chk)...)
+			chk.Reset()
+		}
+	}
+	if chk.NumRows() > 0 {
+		chunks = append(chunks, tipb.Chunk{})
+		cur := &chunks[len(chunks)-1]
+		cur.RowsData = append(cur.RowsData, encoder.Encode(chk)...)
+		chk.Reset()
+	}
+	selResp.Chunks = chunks
+	selResp.EncodeType = tipb.EncodeType_TypeChunk
+	return nil
+}
+
+func buildResp(selResp *tipb.SelectResponse, execDetails []*execDetail, err error) *coprocessor.Response {
+	resp := &coprocessor.Response{}
+
+	if len(execDetails) > 0 {
+		execSummary := make([]*tipb.ExecutorExecutionSummary, 0, len(execDetails))
+		for _, d := range execDetails {
+			costNs := uint64(d.timeProcessed / time.Nanosecond)
+			rows := uint64(d.numProducedRows)
+			numIter := uint64(d.numIterations)
+			execSummary = append(execSummary, &tipb.ExecutorExecutionSummary{
+				TimeProcessedNs: &costNs,
+				NumProducedRows: &rows,
+				NumIterations:   &numIter,
+			})
+		}
+		selResp.ExecutionSummaries = execSummary
+	}
+
+	// Select errors have been contained in `SelectResponse.Error`
+	if locked, ok := errors.Cause(err).(*ErrLocked); ok {
+		resp.Locked = &kvrpcpb.LockInfo{
+			Key:         locked.Key,
+			PrimaryLock: locked.Primary,
+			LockVersion: locked.StartTS,
+			LockTtl:     locked.TTL,
 		}
 	}
 	data, err := proto.Marshal(selResp)
@@ -590,8 +813,16 @@ func toPBError(err error) *tipb.Error {
 		perr.Code = int32(sqlErr.Code)
 		perr.Msg = sqlErr.Message
 	default:
-		perr.Code = int32(1)
-		perr.Msg = err.Error()
+		e := errors.Cause(err)
+		switch y := e.(type) {
+		case *terror.Error:
+			tmp := y.ToSQLError()
+			perr.Code = int32(tmp.Code)
+			perr.Msg = tmp.Message
+		default:
+			perr.Code = int32(1)
+			perr.Msg = err.Error()
+		}
 	}
 	return perr
 }
@@ -613,8 +844,8 @@ func (h *rpcHandler) extractKVRanges(keyRanges []*coprocessor.KeyRange, descScan
 			break
 		}
 		var kvr kv.KeyRange
-		kvr.StartKey = kv.Key(maxStartKey(lowerKey, h.rawStartKey))
-		kvr.EndKey = kv.Key(minEndKey(upperKey, h.rawEndKey))
+		kvr.StartKey = maxStartKey(lowerKey, h.rawStartKey)
+		kvr.EndKey = minEndKey(upperKey, h.rawEndKey)
 		kvRanges = append(kvRanges, kvr)
 	}
 	if descScan {
@@ -642,15 +873,15 @@ func appendRow(chunks []tipb.Chunk, data []byte, rowCnt int) []tipb.Chunk {
 }
 
 func maxStartKey(rangeStartKey kv.Key, regionStartKey []byte) []byte {
-	if bytes.Compare([]byte(rangeStartKey), regionStartKey) > 0 {
-		return []byte(rangeStartKey)
+	if bytes.Compare(rangeStartKey, regionStartKey) > 0 {
+		return rangeStartKey
 	}
 	return regionStartKey
 }
 
 func minEndKey(rangeEndKey kv.Key, regionEndKey []byte) []byte {
-	if len(regionEndKey) == 0 || bytes.Compare([]byte(rangeEndKey), regionEndKey) < 0 {
-		return []byte(rangeEndKey)
+	if len(regionEndKey) == 0 || bytes.Compare(rangeEndKey, regionEndKey) < 0 {
+		return rangeEndKey
 	}
 	return regionEndKey
 }
@@ -696,6 +927,6 @@ func fieldTypeFromPBColumn(col *tipb.ColumnInfo) *types.FieldType {
 		Flen:    int(col.GetColumnLen()),
 		Decimal: int(col.GetDecimal()),
 		Elems:   col.Elems,
-		Collate: mysql.Collations[uint8(col.GetCollation())],
+		Collate: mysql.Collations[uint8(collate.RestoreCollationIDIfNeeded(col.GetCollation()))],
 	}
 }

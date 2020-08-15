@@ -15,23 +15,23 @@ package domain
 
 import (
 	"context"
-	"crypto/tls"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/coreos/etcd/clientv3"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/ngaut/pools"
 	"github.com/ngaut/sync2"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/bindinfo"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/domain/infosync"
+	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/infoschema/perfschema"
 	"github.com/pingcap/tidb/kv"
@@ -41,10 +41,16 @@ import (
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/statistics"
+	"github.com/pingcap/tidb/statistics/handle"
+	"github.com/pingcap/tidb/store/tikv"
+	"github.com/pingcap/tidb/telemetry"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/domainutil"
+	"github.com/pingcap/tidb/util/expensivequery"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sqlexec"
-	log "github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/clientv3"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 )
@@ -52,88 +58,103 @@ import (
 // Domain represents a storage space. Different domains can use the same database name.
 // Multiple domains can be used in parallel without synchronization.
 type Domain struct {
-	store           kv.Storage
-	infoHandle      *infoschema.Handle
-	privHandle      *privileges.Handle
-	statsHandle     unsafe.Pointer
-	statsLease      time.Duration
-	statsUpdating   sync2.AtomicInt32
-	ddl             ddl.DDL
-	info            *InfoSyncer
-	m               sync.Mutex
-	SchemaValidator SchemaValidator
-	sysSessionPool  *sessionPool
-	exit            chan struct{}
-	etcdClient      *clientv3.Client
-	wg              sync.WaitGroup
-	gvc             GlobalVariableCache
-	slowQuery       *topNSlowQueries
-
-	MockReloadFailed MockFailure // It mocks reload failed.
+	store                kv.Storage
+	infoHandle           *infoschema.Handle
+	privHandle           *privileges.Handle
+	bindHandle           *bindinfo.BindHandle
+	statsHandle          unsafe.Pointer
+	statsLease           time.Duration
+	ddl                  ddl.DDL
+	info                 *infosync.InfoSyncer
+	m                    sync.Mutex
+	SchemaValidator      SchemaValidator
+	sysSessionPool       *sessionPool
+	exit                 chan struct{}
+	etcdClient           *clientv3.Client
+	gvc                  GlobalVariableCache
+	slowQuery            *topNSlowQueries
+	expensiveQueryHandle *expensivequery.Handle
+	wg                   sync.WaitGroup
+	statsUpdating        sync2.AtomicInt32
+	cancel               context.CancelFunc
 }
 
 // loadInfoSchema loads infoschema at startTS into handle, usedSchemaVersion is the currently used
 // infoschema version, if it is the same as the schema version at startTS, we don't need to reload again.
 // It returns the latest schema version, the changed table IDs, whether it's a full load and an error.
-func (do *Domain) loadInfoSchema(handle *infoschema.Handle, usedSchemaVersion int64, startTS uint64) (int64, []int64, bool, error) {
-	var fullLoad bool
+func (do *Domain) loadInfoSchema(handle *infoschema.Handle, usedSchemaVersion int64,
+	startTS uint64) (neededSchemaVersion int64, change *tikv.RelatedSchemaChange, fullLoad bool, err error) {
 	snapshot, err := do.store.GetSnapshot(kv.NewVersion(startTS))
 	if err != nil {
-		return 0, nil, fullLoad, errors.Trace(err)
+		return 0, nil, fullLoad, err
 	}
 	m := meta.NewSnapshotMeta(snapshot)
-	latestSchemaVersion, err := m.GetSchemaVersion()
+	neededSchemaVersion, err = m.GetSchemaVersion()
 	if err != nil {
-		return 0, nil, fullLoad, errors.Trace(err)
+		return 0, nil, fullLoad, err
 	}
-	if usedSchemaVersion != 0 && usedSchemaVersion == latestSchemaVersion {
-		return latestSchemaVersion, nil, fullLoad, nil
+	if usedSchemaVersion != 0 && usedSchemaVersion == neededSchemaVersion {
+		return neededSchemaVersion, nil, fullLoad, nil
 	}
 
 	// Update self schema version to etcd.
 	defer func() {
-		if err != nil {
-			log.Info("[ddl] not update self schema version to etcd")
+		// There are two possibilities for not updating the self schema version to etcd.
+		// 1. Failed to loading schema information.
+		// 2. When users use history read feature, the neededSchemaVersion isn't the latest schema version.
+		if err != nil || neededSchemaVersion < do.InfoSchema().SchemaMetaVersion() {
+			logutil.BgLogger().Info("do not update self schema version to etcd",
+				zap.Int64("usedSchemaVersion", usedSchemaVersion),
+				zap.Int64("neededSchemaVersion", neededSchemaVersion), zap.Error(err))
 			return
 		}
-		err = do.ddl.SchemaSyncer().UpdateSelfVersion(context.Background(), latestSchemaVersion)
+
+		err = do.ddl.SchemaSyncer().UpdateSelfVersion(context.Background(), neededSchemaVersion)
 		if err != nil {
-			log.Infof("[ddl] update self version from %v to %v failed %v", usedSchemaVersion, latestSchemaVersion, err)
+			logutil.BgLogger().Info("update self version failed",
+				zap.Int64("usedSchemaVersion", usedSchemaVersion),
+				zap.Int64("neededSchemaVersion", neededSchemaVersion), zap.Error(err))
 		}
 	}()
 
 	startTime := time.Now()
-	ok, tblIDs, err := do.tryLoadSchemaDiffs(m, usedSchemaVersion, latestSchemaVersion)
+	ok, relatedChanges, err := do.tryLoadSchemaDiffs(m, usedSchemaVersion, neededSchemaVersion)
 	if err != nil {
 		// We can fall back to full load, don't need to return the error.
-		log.Errorf("[ddl] failed to load schema diff err %v", err)
+		logutil.BgLogger().Error("failed to load schema diff", zap.Error(err))
 	}
 	if ok {
-		log.Infof("[ddl] diff load InfoSchema from version %d to %d in %v, tableIDs %v",
-			usedSchemaVersion, latestSchemaVersion, time.Since(startTime), tblIDs)
-		return latestSchemaVersion, tblIDs, fullLoad, nil
+		logutil.BgLogger().Info("diff load InfoSchema success",
+			zap.Int64("usedSchemaVersion", usedSchemaVersion),
+			zap.Int64("neededSchemaVersion", neededSchemaVersion),
+			zap.Duration("start time", time.Since(startTime)),
+			zap.Int64s("phyTblIDs", relatedChanges.PhyTblIDS),
+			zap.Uint64s("actionTypes", relatedChanges.ActionTypes))
+		return neededSchemaVersion, relatedChanges, fullLoad, nil
 	}
 
 	fullLoad = true
 	schemas, err := do.fetchAllSchemasWithTables(m)
 	if err != nil {
-		return 0, nil, fullLoad, errors.Trace(err)
+		return 0, nil, fullLoad, err
 	}
 
-	newISBuilder, err := infoschema.NewBuilder(handle).InitWithDBInfos(schemas, latestSchemaVersion)
+	newISBuilder, err := infoschema.NewBuilder(handle).InitWithDBInfos(schemas, neededSchemaVersion)
 	if err != nil {
-		return 0, nil, fullLoad, errors.Trace(err)
+		return 0, nil, fullLoad, err
 	}
-	log.Infof("[ddl] full load InfoSchema from version %d to %d, in %v",
-		usedSchemaVersion, latestSchemaVersion, time.Since(startTime))
+	logutil.BgLogger().Info("full load InfoSchema success",
+		zap.Int64("usedSchemaVersion", usedSchemaVersion),
+		zap.Int64("neededSchemaVersion", neededSchemaVersion),
+		zap.Duration("start time", time.Since(startTime)))
 	newISBuilder.Build()
-	return latestSchemaVersion, nil, fullLoad, nil
+	return neededSchemaVersion, nil, fullLoad, nil
 }
 
 func (do *Domain) fetchAllSchemasWithTables(m *meta.Meta) ([]*model.DBInfo, error) {
 	allSchemas, err := m.ListDatabases()
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	splittedSchemas := do.splitForConcurrentFetch(allSchemas)
 	doneCh := make(chan error, len(splittedSchemas))
@@ -143,7 +164,7 @@ func (do *Domain) fetchAllSchemasWithTables(m *meta.Meta) ([]*model.DBInfo, erro
 	for range splittedSchemas {
 		err = <-doneCh
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 	}
 	return allSchemas, nil
@@ -176,10 +197,21 @@ func (do *Domain) fetchSchemasWithTables(schemas []*model.DBInfo, m *meta.Meta, 
 			done <- err
 			return
 		}
+		// If TreatOldVersionUTF8AsUTF8MB4 was enable, need to convert the old version schema UTF8 charset to UTF8MB4.
+		if config.GetGlobalConfig().TreatOldVersionUTF8AsUTF8MB4 {
+			for _, tbInfo := range tables {
+				infoschema.ConvertOldVersionUTF8ToUTF8MB4IfNeed(tbInfo)
+			}
+		}
 		di.Tables = make([]*model.TableInfo, 0, len(tables))
 		for _, tbl := range tables {
 			if tbl.State != model.StatePublic {
 				// schema is not public, can't be used outside.
+				continue
+			}
+			infoschema.ConvertCharsetCollateToLowerCaseIfNeed(tbl)
+			// Check whether the table is in repair mode.
+			if domainutil.RepairInfo.InRepairMode() && domainutil.RepairInfo.CheckAndFetchRepairedTable(di, tbl) {
 				continue
 			}
 			di.Tables = append(di.Tables, tbl)
@@ -203,15 +235,11 @@ func isTooOldSchema(usedVersion, newVersion int64) bool {
 // tryLoadSchemaDiffs tries to only load latest schema changes.
 // Return true if the schema is loaded successfully.
 // Return false if the schema can not be loaded by schema diff, then we need to do full load.
-// The second returned value is the delta updated table IDs.
-func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64) (bool, []int64, error) {
+// The second returned value is the delta updated table and partition IDs.
+func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64) (bool, *tikv.RelatedSchemaChange, error) {
 	// If there isn't any used version, or used version is too old, we do full load.
+	// And when users use history read feature, we will set usedVersion to initialVersion, then full load is needed.
 	if isTooOldSchema(usedVersion, newVersion) {
-		return false, nil, nil
-	}
-	if usedVersion > newVersion {
-		// When user use History Read feature, history schema will be loaded.
-		// usedVersion may be larger than newVersion, full load is needed.
 		return false, nil, nil
 	}
 	var diffs []*model.SchemaDiff
@@ -219,7 +247,7 @@ func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64
 		usedVersion++
 		diff, err := m.GetSchemaDiff(usedVersion)
 		if err != nil {
-			return false, nil, errors.Trace(err)
+			return false, nil, err
 		}
 		if diff == nil {
 			// If diff is missing for any version between used and new version, we fall back to full reload.
@@ -228,16 +256,34 @@ func (do *Domain) tryLoadSchemaDiffs(m *meta.Meta, usedVersion, newVersion int64
 		diffs = append(diffs, diff)
 	}
 	builder := infoschema.NewBuilder(do.infoHandle).InitWithOldInfoSchema()
-	tblIDs := make([]int64, 0, len(diffs))
+	phyTblIDs := make([]int64, 0, len(diffs))
+	actions := make([]uint64, 0, len(diffs))
 	for _, diff := range diffs {
-		ids, err := builder.ApplyDiff(m, diff)
+		IDs, err := builder.ApplyDiff(m, diff)
 		if err != nil {
-			return false, nil, errors.Trace(err)
+			return false, nil, err
 		}
-		tblIDs = append(tblIDs, ids...)
+		if canSkipSchemaCheckerDDL(diff.Type) {
+			continue
+		}
+		phyTblIDs = append(phyTblIDs, IDs...)
+		for i := 0; i < len(IDs); i++ {
+			actions = append(actions, uint64(1<<diff.Type))
+		}
 	}
 	builder.Build()
-	return true, tblIDs, nil
+	relatedChange := tikv.RelatedSchemaChange{}
+	relatedChange.PhyTblIDS = phyTblIDs
+	relatedChange.ActionTypes = actions
+	return true, &relatedChange, nil
+}
+
+func canSkipSchemaCheckerDDL(tp model.ActionType) bool {
+	switch tp {
+	case model.ActionUpdateTiFlashReplicaStatus, model.ActionSetTiFlashReplica:
+		return true
+	}
+	return false
 }
 
 // InfoSchema gets information schema from domain.
@@ -248,9 +294,10 @@ func (do *Domain) InfoSchema() infoschema.InfoSchema {
 // GetSnapshotInfoSchema gets a snapshot information schema.
 func (do *Domain) GetSnapshotInfoSchema(snapshotTS uint64) (infoschema.InfoSchema, error) {
 	snapHandle := do.infoHandle.EmptyClone()
-	_, _, _, err := do.loadInfoSchema(snapHandle, do.infoHandle.Get().SchemaMetaVersion(), snapshotTS)
+	// For the snapHandle, it's an empty Handle, so its usedSchemaVersion is initialVersion.
+	_, _, _, err := do.loadInfoSchema(snapHandle, initialVersion, snapshotTS)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	return snapHandle.Get(), nil
 }
@@ -259,7 +306,7 @@ func (do *Domain) GetSnapshotInfoSchema(snapshotTS uint64) (infoschema.InfoSchem
 func (do *Domain) GetSnapshotMeta(startTS uint64) (*meta.Meta, error) {
 	snapshot, err := do.store.GetSnapshot(kv.NewVersion(startTS))
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	return meta.NewSnapshotMeta(snapshot), nil
 }
@@ -270,7 +317,7 @@ func (do *Domain) DDL() ddl.DDL {
 }
 
 // InfoSyncer gets infoSyncer from domain.
-func (do *Domain) InfoSyncer() *InfoSyncer {
+func (do *Domain) InfoSyncer() *infosync.InfoSyncer {
 	return do.info
 }
 
@@ -285,17 +332,14 @@ func (do *Domain) GetScope(status string) variable.ScopeFlag {
 	return variable.DefaultStatusVarScopeFlag
 }
 
-func (do *Domain) mockReloadFailed() error {
-	return errors.New("mock reload failed")
-}
-
 // Reload reloads InfoSchema.
 // It's public in order to do the test.
 func (do *Domain) Reload() error {
-	// for test
-	if do.MockReloadFailed.getValue() {
-		return do.mockReloadFailed()
-	}
+	failpoint.Inject("ErrorMockReloadFailed", func(val failpoint.Value) {
+		if val.(bool) {
+			failpoint.Return(errors.New("mock reload failed"))
+		}
+	})
 
 	// Lock here for only once at the same time.
 	do.m.Lock()
@@ -304,11 +348,11 @@ func (do *Domain) Reload() error {
 	startTime := time.Now()
 
 	var err error
-	var latestSchemaVersion int64
+	var neededSchemaVersion int64
 
 	ver, err := do.store.CurrentVersion()
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	schemaVersion := int64(0)
@@ -318,29 +362,29 @@ func (do *Domain) Reload() error {
 	}
 
 	var (
-		fullLoad        bool
-		changedTableIDs []int64
+		fullLoad       bool
+		relatedChanges *tikv.RelatedSchemaChange
 	)
-	latestSchemaVersion, changedTableIDs, fullLoad, err = do.loadInfoSchema(do.infoHandle, schemaVersion, ver.Ver)
+	neededSchemaVersion, relatedChanges, fullLoad, err = do.loadInfoSchema(do.infoHandle, schemaVersion, ver.Ver)
 	metrics.LoadSchemaDuration.Observe(time.Since(startTime).Seconds())
 	if err != nil {
 		metrics.LoadSchemaCounter.WithLabelValues("failed").Inc()
-		return errors.Trace(err)
+		return err
 	}
 	metrics.LoadSchemaCounter.WithLabelValues("succ").Inc()
 
 	if fullLoad {
-		log.Info("[ddl] full load and reset schema validator.")
+		logutil.BgLogger().Info("full load and reset schema validator")
 		do.SchemaValidator.Reset()
 	}
-	do.SchemaValidator.Update(ver.Ver, schemaVersion, latestSchemaVersion, changedTableIDs)
+	do.SchemaValidator.Update(ver.Ver, schemaVersion, neededSchemaVersion, relatedChanges)
 
 	lease := do.DDL().GetLease()
 	sub := time.Since(startTime)
 	// Reload interval is lease / 2, if load schema time elapses more than this interval,
 	// some query maybe responded by ErrInfoSchemaExpired error.
 	if sub > (lease/2) && lease > 0 {
-		log.Warnf("[ddl] loading schema takes a long time %v", sub)
+		logutil.BgLogger().Warn("loading schema takes a long time", zap.Duration("take time", sub))
 	}
 
 	return nil
@@ -372,10 +416,13 @@ func (do *Domain) ShowSlowQuery(showSlow *ast.ShowSlow) []*SlowQueryInfo {
 }
 
 func (do *Domain) topNSlowQueryLoop() {
-	defer recoverInDomain("topNSlowQueryLoop", false)
-	defer do.wg.Done()
+	defer util.Recover(metrics.LabelDomain, "topNSlowQueryLoop", nil, false)
 	ticker := time.NewTicker(time.Minute * 10)
-	defer ticker.Stop()
+	defer func() {
+		ticker.Stop()
+		do.wg.Done()
+		logutil.BgLogger().Info("topNSlowQueryLoop exited.")
+	}()
 	for {
 		select {
 		case now := <-ticker.C:
@@ -401,29 +448,67 @@ func (do *Domain) topNSlowQueryLoop() {
 }
 
 func (do *Domain) infoSyncerKeeper() {
-	defer do.wg.Done()
-	defer recoverInDomain("infoSyncerKeeper", false)
+	defer func() {
+		do.wg.Done()
+		logutil.BgLogger().Info("infoSyncerKeeper exited.")
+		util.Recover(metrics.LabelDomain, "infoSyncerKeeper", nil, false)
+	}()
+	ticker := time.NewTicker(infosync.ReportInterval)
+	defer ticker.Stop()
 	for {
 		select {
+		case <-ticker.C:
+			do.info.ReportMinStartTS(do.Store())
 		case <-do.info.Done():
-			log.Info("[ddl] server info syncer need to restart")
+			logutil.BgLogger().Info("server info syncer need to restart")
 			if err := do.info.Restart(context.Background()); err != nil {
-				log.Error(err)
+				logutil.BgLogger().Error("server restart failed", zap.Error(err))
 			}
-			log.Info("[ddl] server info syncer restarted.")
+			logutil.BgLogger().Info("server info syncer restarted")
 		case <-do.exit:
 			return
 		}
 	}
 }
 
-func (do *Domain) loadSchemaInLoop(lease time.Duration) {
-	defer do.wg.Done()
+func (do *Domain) topologySyncerKeeper() {
+	defer util.Recover(metrics.LabelDomain, "topologySyncerKeeper", nil, false)
+	ticker := time.NewTicker(infosync.TopologyTimeToRefresh)
+	defer func() {
+		ticker.Stop()
+		do.wg.Done()
+		logutil.BgLogger().Info("topologySyncerKeeper exited.")
+	}()
+
+	for {
+		select {
+		case <-ticker.C:
+			err := do.info.StoreTopologyInfo(context.Background())
+			if err != nil {
+				logutil.BgLogger().Error("refresh topology in loop failed", zap.Error(err))
+			}
+		case <-do.info.TopologyDone():
+			logutil.BgLogger().Info("server topology syncer need to restart")
+			if err := do.info.RestartTopology(context.Background()); err != nil {
+				logutil.BgLogger().Error("server restart failed", zap.Error(err))
+			}
+			logutil.BgLogger().Info("server topology syncer restarted")
+		case <-do.exit:
+			return
+		}
+	}
+}
+
+func (do *Domain) loadSchemaInLoop(ctx context.Context, lease time.Duration) {
+	defer util.Recover(metrics.LabelDomain, "loadSchemaInLoop", nil, true)
 	// Lease renewal can run at any frequency.
 	// Use lease/2 here as recommend by paper.
 	ticker := time.NewTicker(lease / 2)
-	defer ticker.Stop()
-	defer recoverInDomain("loadSchemaInLoop", true)
+	defer func() {
+		ticker.Stop()
+		do.wg.Done()
+		logutil.BgLogger().Info("loadSchemaInLoop exited.")
+	}()
 	syncer := do.ddl.SchemaSyncer()
 
 	for {
@@ -431,21 +516,21 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 		case <-ticker.C:
 			err := do.Reload()
 			if err != nil {
-				log.Errorf("[ddl] reload schema in loop err %v", errors.ErrorStack(err))
+				logutil.BgLogger().Error("reload schema in loop failed", zap.Error(err))
 			}
 		case _, ok := <-syncer.GlobalVersionCh():
 			err := do.Reload()
 			if err != nil {
-				log.Errorf("[ddl] reload schema in loop err %v", errors.ErrorStack(err))
+				logutil.BgLogger().Error("reload schema in loop failed", zap.Error(err))
 			}
 			if !ok {
-				log.Warn("[ddl] reload schema in loop, schema syncer need rewatch")
+				logutil.BgLogger().Warn("reload schema in loop, schema syncer need rewatch")
 				// Make sure the rewatch doesn't affect load schema, so we watch the global schema version asynchronously.
 				syncer.WatchGlobalSchemaVer(context.Background())
 			}
 		case <-syncer.Done():
 			// The schema syncer stops, we need stop the schema validator to synchronize the schema version.
-			log.Info("[ddl] reload schema in loop, schema syncer need restart")
+			logutil.BgLogger().Info("reload schema in loop, schema syncer need restart")
 			// The etcd is responsible for schema synchronization, we should ensure there is at most two different schema version
 			// in the TiDB cluster, to make the data/schema be consistent. If we lost connection/session to etcd, the cluster
 			// will treats this TiDB as a down instance, and etcd will remove the key of `/tidb/ddl/all_schema_versions/tidb-id`.
@@ -453,20 +538,20 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 			// then continue to change the TiDB schema to version 3. Unfortunately, this down TiDB schema version will still be version 1.
 			// And version 1 is not consistent to version 3. So we need to stop the schema validator to prohibit the DML executing.
 			do.SchemaValidator.Stop()
-			err := do.mustRestartSyncer()
+			err := do.mustRestartSyncer(ctx)
 			if err != nil {
-				log.Errorf("[ddl] reload schema in loop, schema syncer restart err %v", errors.ErrorStack(err))
+				logutil.BgLogger().Error("reload schema in loop, schema syncer restart failed", zap.Error(err))
 				break
 			}
 			// The schema maybe changed, must reload schema then the schema validator can restart.
 			exitLoop := do.mustReload()
+			// domain is cosed.
 			if exitLoop {
-				// domain is closed.
-				log.Errorf("[ddl] domain is closed. exit loadSchemaInLoop")
+				logutil.BgLogger().Error("domain is closed, exit loadSchemaInLoop")
 				return
 			}
 			do.SchemaValidator.Restart()
-			log.Info("[ddl] schema syncer restarted.")
+			logutil.BgLogger().Info("schema syncer restarted")
 		case <-do.exit:
 			return
 		}
@@ -475,8 +560,7 @@ func (do *Domain) loadSchemaInLoop(lease time.Duration) {
 
 // mustRestartSyncer tries to restart the SchemaSyncer.
 // It returns until it's successful or the domain is stoped.
-func (do *Domain) mustRestartSyncer() error {
-	ctx := context.Background()
+func (do *Domain) mustRestartSyncer(ctx context.Context) error {
 	syncer := do.ddl.SchemaSyncer()
 
 	for {
@@ -485,13 +569,11 @@ func (do *Domain) mustRestartSyncer() error {
 			return nil
 		}
 		// If the domain has stopped, we return an error immediately.
-		select {
-		case <-do.exit:
-			return errors.Trace(err)
-		default:
+		if do.isClose() {
+			return err
 		}
+		logutil.BgLogger().Error("restart the schema syncer failed", zap.Error(err))
 		time.Sleep(time.Second)
-		log.Infof("[ddl] restart the schema syncer failed %v", err)
 	}
 }
 
@@ -501,39 +583,52 @@ func (do *Domain) mustReload() (exitLoop bool) {
 	for {
 		err := do.Reload()
 		if err == nil {
-			log.Infof("[ddl] mustReload succeed.")
+			logutil.BgLogger().Info("mustReload succeed")
 			return false
 		}
 
-		log.Infof("[ddl] reload the schema failed: %v", err)
 		// If the domain is closed, we returns immediately.
-		select {
-		case <-do.exit:
-			log.Infof("[ddl] domain is closed.")
+		logutil.BgLogger().Info("reload the schema failed", zap.Error(err))
+		if do.isClose() {
 			return true
-		default:
 		}
-
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
+func (do *Domain) isClose() bool {
+	select {
+	case <-do.exit:
+		logutil.BgLogger().Info("domain is closed")
+		return true
+	default:
+	}
+	return false
+}
+
 // Close closes the Domain and release its resource.
 func (do *Domain) Close() {
+	if do == nil {
+		return
+	}
+	startTime := time.Now()
 	if do.ddl != nil {
-		terror.Log(errors.Trace(do.ddl.Stop()))
+		terror.Log(do.ddl.Stop())
 	}
 	if do.info != nil {
 		do.info.RemoveServerInfo()
+		do.info.RemoveMinStartTS()
 	}
 	close(do.exit)
 	if do.etcdClient != nil {
 		terror.Log(errors.Trace(do.etcdClient.Close()))
 	}
+
 	do.sysSessionPool.Close()
 	do.slowQuery.Close()
+	do.cancel()
 	do.wg.Wait()
-	log.Info("[domain] close")
+	logutil.BgLogger().Info("domain closed", zap.Duration("take time", time.Since(startTime)))
 }
 
 type ddlCallback struct {
@@ -545,41 +640,14 @@ func (c *ddlCallback) OnChanged(err error) error {
 	if err != nil {
 		return err
 	}
-	log.Infof("[ddl] on DDL change, must reload")
+	logutil.BgLogger().Info("performing DDL change, must reload")
 
 	err = c.do.Reload()
 	if err != nil {
-		log.Errorf("[ddl] on DDL change reload err %v", err)
+		logutil.BgLogger().Error("performing DDL change failed", zap.Error(err))
 	}
 
 	return nil
-}
-
-// MockFailure mocks reload failed.
-// It's used for fixing data race in tests.
-type MockFailure struct {
-	sync.RWMutex
-	val bool // val is true means we need to mock reload failed.
-}
-
-// SetValue sets whether we need to mock reload failed.
-func (m *MockFailure) SetValue(isFailed bool) {
-	m.Lock()
-	defer m.Unlock()
-	m.val = isFailed
-}
-
-func (m *MockFailure) getValue() bool {
-	m.RLock()
-	defer m.RUnlock()
-	return m.val
-}
-
-// EtcdBackend is used for judging a storage is a real TiKV.
-type EtcdBackend interface {
-	EtcdAddrs() []string
-	TLSConfig() *tls.Config
-	StartGCWorker() error
 }
 
 const resourceIdleTimeout = 3 * time.Minute // resources in the ResourcePool will be recycled after idleTimeout
@@ -587,34 +655,39 @@ const resourceIdleTimeout = 3 * time.Minute // resources in the ResourcePool wil
 // NewDomain creates a new domain. Should not create multiple domains for the same store.
 func NewDomain(store kv.Storage, ddlLease time.Duration, statsLease time.Duration, factory pools.Factory) *Domain {
 	capacity := 200 // capacity of the sysSessionPool size
-	return &Domain{
-		store:           store,
-		SchemaValidator: NewSchemaValidator(ddlLease),
-		exit:            make(chan struct{}),
-		sysSessionPool:  newSessionPool(capacity, factory),
-		statsLease:      statsLease,
-		infoHandle:      infoschema.NewHandle(store),
-		slowQuery:       newTopNSlowQueries(30, time.Hour*24*7, 500),
+	do := &Domain{
+		store:          store,
+		exit:           make(chan struct{}),
+		sysSessionPool: newSessionPool(capacity, factory),
+		statsLease:     statsLease,
+		infoHandle:     infoschema.NewHandle(store),
+		slowQuery:      newTopNSlowQueries(30, time.Hour*24*7, 500),
 	}
+
+	do.SchemaValidator = NewSchemaValidator(ddlLease, do)
+	return do
 }
 
 // Init initializes a domain.
 func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.Resource, error)) error {
 	perfschema.Init()
-	if ebd, ok := do.store.(EtcdBackend); ok {
+	if ebd, ok := do.store.(tikv.EtcdBackend); ok {
 		if addrs := ebd.EtcdAddrs(); addrs != nil {
 			cfg := config.GetGlobalConfig()
+			// silence etcd warn log, when domain closed, it won't randomly print warn log
+			// see details at the issue https://github.com/pingcap/tidb/issues/15479
+			etcdLogCfg := zap.NewProductionConfig()
+			etcdLogCfg.Level = zap.NewAtomicLevelAt(zap.ErrorLevel)
 			cli, err := clientv3.New(clientv3.Config{
-				Endpoints:   addrs,
-				DialTimeout: 5 * time.Second,
+				LogConfig:        &etcdLogCfg,
+				Endpoints:        addrs,
+				AutoSyncInterval: 30 * time.Second,
+				DialTimeout:      5 * time.Second,
 				DialOptions: []grpc.DialOption{
-					grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
-					grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
 					grpc.WithBackoffMaxDelay(time.Second * 3),
 					grpc.WithKeepaliveParams(keepalive.ClientParameters{
-						Time:                time.Duration(cfg.TiKVClient.GrpcKeepAliveTime) * time.Second,
-						Timeout:             time.Duration(cfg.TiKVClient.GrpcKeepAliveTimeout) * time.Second,
-						PermitWithoutStream: true,
+						Time:    time.Duration(cfg.TiKVClient.GrpcKeepAliveTime) * time.Second,
+						Timeout: time.Duration(cfg.TiKVClient.GrpcKeepAliveTimeout) * time.Second,
 					}),
 				},
 				TLS: ebd.TLSConfig(),
@@ -636,22 +709,43 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 		return sysFactory(do)
 	}
 	sysCtxPool := pools.NewResourcePool(sysFac, 2, 2, resourceIdleTimeout)
-	ctx := context.Background()
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	do.cancel = cancelFunc
 	callback := &ddlCallback{do: do}
-	do.ddl = ddl.NewDDL(ctx, do.etcdClient, do.store, do.infoHandle, callback, ddlLease, sysCtxPool)
-
-	err := do.ddl.SchemaSyncer().Init(ctx)
+	d := do.ddl
+	do.ddl = ddl.NewDDL(
+		ctx,
+		ddl.WithEtcdClient(do.etcdClient),
+		ddl.WithStore(do.store),
+		ddl.WithInfoHandle(do.infoHandle),
+		ddl.WithHook(callback),
+		ddl.WithLease(ddlLease),
+	)
+	err := do.ddl.Start(sysCtxPool)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
-	do.info = NewInfoSyncer(do.ddl.GetID(), do.etcdClient)
-	err = do.info.Init(ctx)
+	failpoint.Inject("MockReplaceDDL", func(val failpoint.Value) {
+		if val.(bool) {
+			if err := do.ddl.Stop(); err != nil {
+				logutil.BgLogger().Error("stop DDL failed", zap.Error(err))
+			}
+			do.ddl = d
+		}
+	})
+
+	skipRegisterToDashboard := config.GetGlobalConfig().SkipRegisterToDashboard
+	err = do.ddl.SchemaSyncer().Init(ctx)
 	if err != nil {
-		return errors.Trace(err)
+		return err
+	}
+	do.info, err = infosync.GlobalInfoSyncerInit(ctx, do.ddl.GetID(), do.etcdClient, skipRegisterToDashboard)
+	if err != nil {
+		return err
 	}
 	err = do.Reload()
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	// Only when the store is local that the lease value is 0.
@@ -659,13 +753,19 @@ func (do *Domain) Init(ddlLease time.Duration, sysFactory func(*Domain) (pools.R
 	if ddlLease > 0 {
 		do.wg.Add(1)
 		// Local store needs to get the change information for every DDL state in each session.
-		go do.loadSchemaInLoop(ddlLease)
+		go do.loadSchemaInLoop(ctx, ddlLease)
 	}
 	do.wg.Add(1)
 	go do.topNSlowQueryLoop()
 
 	do.wg.Add(1)
 	go do.infoSyncerKeeper()
+
+	if !skipRegisterToDashboard {
+		do.wg.Add(1)
+		go do.topologySyncerKeeper()
+	}
+
 	return nil
 }
 
@@ -732,6 +832,11 @@ func (do *Domain) SysSessionPool() *sessionPool {
 	return do.sysSessionPool
 }
 
+// GetEtcdClient returns the etcd client.
+func (do *Domain) GetEtcdClient() *clientv3.Client {
+	return do.etcdClient
+}
+
 // LoadPrivilegeLoop create a goroutine loads privilege tables in a loop, it
 // should be called only once in BootstrapSession.
 func (do *Domain) LoadPrivilegeLoop(ctx sessionctx.Context) error {
@@ -739,7 +844,7 @@ func (do *Domain) LoadPrivilegeLoop(ctx sessionctx.Context) error {
 	do.privHandle = privileges.NewHandle()
 	err := do.privHandle.Update(ctx)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	var watchCh clientv3.WatchChan
@@ -749,8 +854,13 @@ func (do *Domain) LoadPrivilegeLoop(ctx sessionctx.Context) error {
 		duration = 10 * time.Minute
 	}
 
+	do.wg.Add(1)
 	go func() {
-		defer recoverInDomain("loadPrivilegeInLoop", false)
+		defer func() {
+			do.wg.Done()
+			logutil.BgLogger().Info("loadPrivilegeInLoop exited.")
+			util.Recover(metrics.LabelDomain, "loadPrivilegeInLoop", nil, false)
+		}()
 		var count int
 		for {
 			ok := true
@@ -761,7 +871,7 @@ func (do *Domain) LoadPrivilegeLoop(ctx sessionctx.Context) error {
 			case <-time.After(duration):
 			}
 			if !ok {
-				log.Error("[domain] load privilege loop watch channel closed.")
+				logutil.BgLogger().Error("load privilege loop watch channel closed")
 				watchCh = do.etcdClient.Watch(context.Background(), privilegeKey)
 				count++
 				if count > 10 {
@@ -774,9 +884,7 @@ func (do *Domain) LoadPrivilegeLoop(ctx sessionctx.Context) error {
 			err := do.privHandle.Update(ctx)
 			metrics.LoadPrivilegeCounter.WithLabelValues(metrics.RetLabel(err)).Inc()
 			if err != nil {
-				log.Error("[domain] load privilege fail:", errors.ErrorStack(err))
-			} else {
-				log.Info("[domain] reload privilege success.")
+				logutil.BgLogger().Error("load privilege failed", zap.Error(err))
 			}
 		}
 	}()
@@ -788,14 +896,121 @@ func (do *Domain) PrivilegeHandle() *privileges.Handle {
 	return do.privHandle
 }
 
+// BindHandle returns domain's bindHandle.
+func (do *Domain) BindHandle() *bindinfo.BindHandle {
+	return do.bindHandle
+}
+
+// LoadBindInfoLoop create a goroutine loads BindInfo in a loop, it should
+// be called only once in BootstrapSession.
+func (do *Domain) LoadBindInfoLoop(ctxForHandle sessionctx.Context, ctxForEvolve sessionctx.Context) error {
+	ctxForHandle.GetSessionVars().InRestrictedSQL = true
+	ctxForEvolve.GetSessionVars().InRestrictedSQL = true
+	do.bindHandle = bindinfo.NewBindHandle(ctxForHandle)
+	err := do.bindHandle.Update(true)
+	if err != nil || bindinfo.Lease == 0 {
+		return err
+	}
+
+	do.globalBindHandleWorkerLoop()
+	do.handleEvolvePlanTasksLoop(ctxForEvolve)
+	return nil
+}
+
+func (do *Domain) globalBindHandleWorkerLoop() {
+	do.wg.Add(1)
+	go func() {
+		defer func() {
+			do.wg.Done()
+			logutil.BgLogger().Info("globalBindHandleWorkerLoop exited.")
+			util.Recover(metrics.LabelDomain, "globalBindHandleWorkerLoop", nil, false)
+		}()
+		bindWorkerTicker := time.NewTicker(bindinfo.Lease)
+		defer bindWorkerTicker.Stop()
+		for {
+			select {
+			case <-do.exit:
+				return
+			case <-bindWorkerTicker.C:
+				err := do.bindHandle.Update(false)
+				if err != nil {
+					logutil.BgLogger().Error("update bindinfo failed", zap.Error(err))
+				}
+				do.bindHandle.DropInvalidBindRecord()
+				if variable.TiDBOptOn(variable.CapturePlanBaseline.GetVal()) {
+					do.bindHandle.CaptureBaselines()
+				}
+				do.bindHandle.SaveEvolveTasksToStore()
+			}
+		}
+	}()
+}
+
+func (do *Domain) handleEvolvePlanTasksLoop(ctx sessionctx.Context) {
+	do.wg.Add(1)
+	go func() {
+		defer func() {
+			do.wg.Done()
+			logutil.BgLogger().Info("handleEvolvePlanTasksLoop exited.")
+			util.Recover(metrics.LabelDomain, "handleEvolvePlanTasksLoop", nil, false)
+		}()
+		owner := do.newOwnerManager(bindinfo.Prompt, bindinfo.OwnerKey)
+		for {
+			select {
+			case <-do.exit:
+				owner.Cancel()
+				return
+			case <-time.After(bindinfo.Lease):
+			}
+			if owner.IsOwner() {
+				err := do.bindHandle.HandleEvolvePlanTask(ctx, false)
+				if err != nil {
+					logutil.BgLogger().Info("evolve plan failed", zap.Error(err))
+				}
+			}
+		}
+	}()
+}
+
+// TelemetryLoop create a goroutine that reports usage data in a loop, it should be called only once
+// in BootstrapSession.
+func (do *Domain) TelemetryLoop(ctx sessionctx.Context) {
+	ctx.GetSessionVars().InRestrictedSQL = true
+	do.wg.Add(1)
+	go func() {
+		defer func() {
+			do.wg.Done()
+			logutil.BgLogger().Info("handleTelemetryLoop exited.")
+			util.Recover(metrics.LabelDomain, "handleTelemetryLoop", nil, false)
+		}()
+		owner := do.newOwnerManager(telemetry.Prompt, telemetry.OwnerKey)
+		for {
+			select {
+			case <-do.exit:
+				owner.Cancel()
+				return
+			case <-time.After(telemetry.ReportInterval):
+				if !owner.IsOwner() {
+					continue
+				}
+				err := telemetry.ReportUsageData(ctx, do.GetEtcdClient())
+				if err != nil {
+					// Only status update errors will be printed out
+					logutil.BgLogger().Warn("handleTelemetryLoop status update failed", zap.Error(err))
+				}
+			}
+		}
+	}()
+}
+
 // StatsHandle returns the statistic handle.
-func (do *Domain) StatsHandle() *statistics.Handle {
-	return (*statistics.Handle)(atomic.LoadPointer(&do.statsHandle))
+func (do *Domain) StatsHandle() *handle.Handle {
+	return (*handle.Handle)(atomic.LoadPointer(&do.statsHandle))
 }
 
 // CreateStatsHandle is used only for test.
 func (do *Domain) CreateStatsHandle(ctx sessionctx.Context) {
-	atomic.StorePointer(&do.statsHandle, unsafe.Pointer(statistics.NewHandle(ctx, do.statsLease)))
+	atomic.StorePointer(&do.statsHandle, unsafe.Pointer(handle.NewHandle(ctx, do.statsLease)))
 }
 
 // StatsUpdating checks if the stats worker is updating.
@@ -820,13 +1035,18 @@ var RunAutoAnalyze = true
 // It should be called only once in BootstrapSession.
 func (do *Domain) UpdateTableStatsLoop(ctx sessionctx.Context) error {
 	ctx.GetSessionVars().InRestrictedSQL = true
-	statsHandle := statistics.NewHandle(ctx, do.statsLease)
+	statsHandle := handle.NewHandle(ctx, do.statsLease)
 	atomic.StorePointer(&do.statsHandle, unsafe.Pointer(statsHandle))
 	do.ddl.RegisterEventCh(statsHandle.DDLEventCh())
+	// Negative stats lease indicates that it is in test, it does not need update.
+	if do.statsLease >= 0 {
+		do.wg.Add(1)
+		go do.loadStatsWorker()
+	}
 	if do.statsLease <= 0 {
 		return nil
 	}
-	owner := do.newStatsOwner()
+	owner := do.newOwnerManager(handle.StatsPrompt, handle.StatsOwnerKey)
 	do.wg.Add(1)
 	do.SetStatsUpdating(true)
 	go do.updateStatsWorker(ctx, owner)
@@ -837,111 +1057,128 @@ func (do *Domain) UpdateTableStatsLoop(ctx sessionctx.Context) error {
 	return nil
 }
 
-func (do *Domain) newStatsOwner() owner.Manager {
+func (do *Domain) newOwnerManager(prompt, ownerKey string) owner.Manager {
 	id := do.ddl.OwnerManager().ID()
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 	var statsOwner owner.Manager
 	if do.etcdClient == nil {
-		statsOwner = owner.NewMockManager(id, cancelFunc)
+		statsOwner = owner.NewMockManager(context.Background(), id)
 	} else {
-		statsOwner = owner.NewOwnerManager(do.etcdClient, statistics.StatsPrompt, id, statistics.StatsOwnerKey, cancelFunc)
+		statsOwner = owner.NewOwnerManager(context.Background(), do.etcdClient, prompt, id, ownerKey)
 	}
 	// TODO: Need to do something when err is not nil.
-	err := statsOwner.CampaignOwner(cancelCtx)
+	err := statsOwner.CampaignOwner()
 	if err != nil {
-		log.Warnf("[stats] campaign owner fail: %s", errors.ErrorStack(err))
+		logutil.BgLogger().Warn("campaign owner failed", zap.Error(err))
 	}
 	return statsOwner
 }
 
-func (do *Domain) updateStatsWorker(ctx sessionctx.Context, owner owner.Manager) {
-	defer recoverInDomain("updateStatsWorker", false)
+func (do *Domain) loadStatsWorker() {
+	defer util.Recover(metrics.LabelDomain, "loadStatsWorker", nil, false)
 	lease := do.statsLease
-	deltaUpdateDuration := lease * 20
+	if lease == 0 {
+		lease = 3 * time.Second
+	}
 	loadTicker := time.NewTicker(lease)
-	defer loadTicker.Stop()
-	deltaUpdateTicker := time.NewTicker(deltaUpdateDuration)
-	defer deltaUpdateTicker.Stop()
-	loadHistogramTicker := time.NewTicker(lease)
-	defer loadHistogramTicker.Stop()
-	gcStatsTicker := time.NewTicker(100 * lease)
-	defer gcStatsTicker.Stop()
-	dumpFeedbackTicker := time.NewTicker(200 * lease)
-	defer dumpFeedbackTicker.Stop()
-	loadFeedbackTicker := time.NewTicker(5 * lease)
-	defer loadFeedbackTicker.Stop()
+	defer func() {
+		loadTicker.Stop()
+		do.wg.Done()
+		logutil.BgLogger().Info("loadStatsWorker exited.")
+	}()
 	statsHandle := do.StatsHandle()
 	t := time.Now()
 	err := statsHandle.InitStats(do.InfoSchema())
 	if err != nil {
-		log.Debug("[stats] init stats info failed: ", errors.ErrorStack(err))
+		logutil.BgLogger().Debug("init stats info failed", zap.Error(err))
 	} else {
-		log.Info("[stats] init stats info takes ", time.Since(t))
+		logutil.BgLogger().Info("init stats info time", zap.Duration("take time", time.Since(t)))
 	}
-	defer func() {
-		do.SetStatsUpdating(false)
-		do.wg.Done()
-	}()
 	for {
 		select {
 		case <-loadTicker.C:
 			err = statsHandle.Update(do.InfoSchema())
 			if err != nil {
-				log.Debug("[stats] update stats info fail: ", errors.ErrorStack(err))
+				logutil.BgLogger().Debug("update stats info failed", zap.Error(err))
+			}
+			err = statsHandle.LoadNeededHistograms()
+			if err != nil {
+				logutil.BgLogger().Debug("load histograms failed", zap.Error(err))
 			}
 		case <-do.exit:
+			return
+		}
+	}
+}
+
+func (do *Domain) updateStatsWorker(ctx sessionctx.Context, owner owner.Manager) {
+	defer util.Recover(metrics.LabelDomain, "updateStatsWorker", nil, false)
+	lease := do.statsLease
+	deltaUpdateTicker := time.NewTicker(20 * lease)
+	gcStatsTicker := time.NewTicker(100 * lease)
+	dumpFeedbackTicker := time.NewTicker(200 * lease)
+	loadFeedbackTicker := time.NewTicker(5 * lease)
+	statsHandle := do.StatsHandle()
+	defer func() {
+		loadFeedbackTicker.Stop()
+		dumpFeedbackTicker.Stop()
+		gcStatsTicker.Stop()
+		deltaUpdateTicker.Stop()
+		do.SetStatsUpdating(false)
+		do.wg.Done()
+		logutil.BgLogger().Info("updateStatsWorker exited.")
+	}()
+	for {
+		select {
+		case <-do.exit:
 			statsHandle.FlushStats()
+			owner.Cancel()
 			return
 			// This channel is sent only by ddl owner.
 		case t := <-statsHandle.DDLEventCh():
-			err = statsHandle.HandleDDLEvent(t)
+			err := statsHandle.HandleDDLEvent(t)
 			if err != nil {
-				log.Debug("[stats] handle ddl event fail: ", errors.ErrorStack(err))
+				logutil.BgLogger().Debug("handle ddl event failed", zap.Error(err))
 			}
 		case <-deltaUpdateTicker.C:
-			err = statsHandle.DumpStatsDeltaToKV(statistics.DumpDelta)
+			err := statsHandle.DumpStatsDeltaToKV(handle.DumpDelta)
 			if err != nil {
-				log.Debug("[stats] dump stats delta fail: ", errors.ErrorStack(err))
+				logutil.BgLogger().Debug("dump stats delta failed", zap.Error(err))
 			}
 			statsHandle.UpdateErrorRate(do.InfoSchema())
-		case <-loadHistogramTicker.C:
-			err = statsHandle.LoadNeededHistograms()
-			if err != nil {
-				log.Debug("[stats] load histograms fail: ", errors.ErrorStack(err))
-			}
 		case <-loadFeedbackTicker.C:
 			statsHandle.UpdateStatsByLocalFeedback(do.InfoSchema())
 			if !owner.IsOwner() {
 				continue
 			}
-			err = statsHandle.HandleUpdateStats(do.InfoSchema())
+			err := statsHandle.HandleUpdateStats(do.InfoSchema())
 			if err != nil {
-				log.Debug("[stats] update stats using feedback fail: ", errors.ErrorStack(err))
+				logutil.BgLogger().Debug("update stats using feedback failed", zap.Error(err))
 			}
 		case <-dumpFeedbackTicker.C:
-			err = statsHandle.DumpStatsFeedbackToKV()
+			err := statsHandle.DumpStatsFeedbackToKV()
 			if err != nil {
-				log.Debug("[stats] dump stats feedback fail: ", errors.ErrorStack(err))
+				logutil.BgLogger().Debug("dump stats feedback failed", zap.Error(err))
 			}
 		case <-gcStatsTicker.C:
 			if !owner.IsOwner() {
 				continue
 			}
-			err = statsHandle.GCStats(do.InfoSchema(), do.DDL().GetLease())
+			err := statsHandle.GCStats(do.InfoSchema(), do.DDL().GetLease())
 			if err != nil {
-				log.Debug("[stats] gc stats fail: ", errors.ErrorStack(err))
+				logutil.BgLogger().Debug("GC stats failed", zap.Error(err))
 			}
 		}
 	}
 }
 
 func (do *Domain) autoAnalyzeWorker(owner owner.Manager) {
-	defer recoverInDomain("autoAnalyzeWorker", false)
+	defer util.Recover(metrics.LabelDomain, "autoAnalyzeWorker", nil, false)
 	statsHandle := do.StatsHandle()
 	analyzeTicker := time.NewTicker(do.statsLease)
 	defer func() {
 		analyzeTicker.Stop()
 		do.wg.Done()
+		logutil.BgLogger().Info("autoAnalyzeWorker exited.")
 	}()
 	for {
 		select {
@@ -955,6 +1192,16 @@ func (do *Domain) autoAnalyzeWorker(owner owner.Manager) {
 	}
 }
 
+// ExpensiveQueryHandle returns the expensive query handle.
+func (do *Domain) ExpensiveQueryHandle() *expensivequery.Handle {
+	return do.expensiveQueryHandle
+}
+
+// InitExpensiveQueryHandle init the expensive query handler.
+func (do *Domain) InitExpensiveQueryHandle() {
+	do.expensiveQueryHandle = expensivequery.NewExpensiveQueryHandle(do.exit)
+}
+
 const privilegeKey = "/tidb/privilege"
 
 // NotifyUpdatePrivilege updates privilege key in etcd, TiDB client that watches
@@ -964,45 +1211,20 @@ func (do *Domain) NotifyUpdatePrivilege(ctx sessionctx.Context) {
 		row := do.etcdClient.KV
 		_, err := row.Put(context.Background(), privilegeKey, "")
 		if err != nil {
-			log.Warn("notify update privilege failed:", err)
+			logutil.BgLogger().Warn("notify update privilege failed", zap.Error(err))
 		}
 	}
 	// update locally
-	_, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, `FLUSH PRIVILEGES`)
+	_, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(`FLUSH PRIVILEGES`)
 	if err != nil {
-		log.Errorf("Unable to update privileges: %s", err)
+		logutil.BgLogger().Error("unable to update privileges", zap.Error(err))
 	}
 }
-
-func recoverInDomain(funcName string, quit bool) {
-	r := recover()
-	if r == nil {
-		return
-	}
-	buf := util.GetStack()
-	log.Errorf("%s, %v, %s", funcName, r, buf)
-	metrics.PanicCounter.WithLabelValues(metrics.LabelDomain).Inc()
-	if quit {
-		// Wait for metrics to be pushed.
-		time.Sleep(time.Second * 15)
-		os.Exit(1)
-	}
-}
-
-// Domain error codes.
-const (
-	codeInfoSchemaExpired terror.ErrCode = 1
-	codeInfoSchemaChanged terror.ErrCode = 2
-)
 
 var (
 	// ErrInfoSchemaExpired returns the error that information schema is out of date.
-	ErrInfoSchemaExpired = terror.ClassDomain.New(codeInfoSchemaExpired, "Information schema is out of date.")
+	ErrInfoSchemaExpired = terror.ClassDomain.New(errno.ErrInfoSchemaExpired, errno.MySQLErrName[errno.ErrInfoSchemaExpired])
 	// ErrInfoSchemaChanged returns the error that information schema is changed.
-	ErrInfoSchemaChanged = terror.ClassDomain.New(codeInfoSchemaChanged, "Information schema is changed.")
+	ErrInfoSchemaChanged = terror.ClassDomain.New(errno.ErrInfoSchemaChanged,
+		errno.MySQLErrName[errno.ErrInfoSchemaChanged]+". "+kv.TxnRetryableMark)
 )
-
-func init() {
-	// Map error codes to mysql error codes.
-	terror.ErrClassToMySQLCodes[terror.ClassDomain] = make(map[terror.ErrCode]uint16)
-}

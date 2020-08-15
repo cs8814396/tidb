@@ -20,10 +20,10 @@ import (
 	"fmt"
 	"sort"
 	"unicode/utf8"
-	"unsafe"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/util/hack"
+	"github.com/pingcap/tidb/util/stringutil"
 )
 
 // Type returns type of BinaryJSON as string.
@@ -58,22 +58,27 @@ func (bj BinaryJSON) Type() string {
 func (bj BinaryJSON) Unquote() (string, error) {
 	switch bj.TypeCode {
 	case TypeCodeString:
-		s, err := unquoteString(hack.String(bj.GetString()))
-		if err != nil {
-			return "", errors.Trace(err)
-		}
-		// Remove prefix and suffix '"'.
-		slen := len(s)
-		if slen > 1 {
-			head, tail := s[0], s[slen-1]
-			if head == '"' && tail == '"' {
-				return s[1 : slen-1], nil
-			}
-		}
-		return s, nil
+		str := string(hack.String(bj.GetString()))
+		return UnquoteString(str)
 	default:
 		return bj.String(), nil
 	}
+}
+
+// UnquoteString remove quotes in a string,
+// including the quotes at the head and tail of string.
+func UnquoteString(str string) (string, error) {
+	strLen := len(str)
+	if strLen < 2 {
+		return str, nil
+	}
+	head, tail := str[0], str[strLen-1]
+	if head == '"' && tail == '"' {
+		// Remove prefix and suffix '"' before unquoting
+		return unquoteString(str[1 : strLen-1])
+	}
+	// if value is not double quoted, do nothing
+	return str, nil
 }
 
 // unquoteString recognizes the escape sequences shown in:
@@ -139,6 +144,67 @@ func decodeEscapedUnicode(s []byte) (char [4]byte, size int, err error) {
 	size = utf8.RuneLen(rune(unicode))
 	utf8.EncodeRune(char[0:size], rune(unicode))
 	return
+}
+
+// quoteString escapes interior quote and other characters for JSON_QUOTE
+// https://dev.mysql.com/doc/refman/5.7/en/json-creation-functions.html#function_json-quote
+// TODO: add JSON_QUOTE builtin
+func quoteString(s string) string {
+	var escapeByteMap = map[byte]string{
+		'\\': "\\\\",
+		'"':  "\\\"",
+		'\b': "\\b",
+		'\f': "\\f",
+		'\n': "\\n",
+		'\r': "\\r",
+		'\t': "\\t",
+	}
+
+	ret := new(bytes.Buffer)
+	ret.WriteByte('"')
+
+	start := 0
+	hasEscaped := false
+
+	for i := 0; i < len(s); {
+		if b := s[i]; b < utf8.RuneSelf {
+			escaped, ok := escapeByteMap[b]
+			if ok {
+				if start < i {
+					ret.WriteString(s[start:i])
+				}
+				hasEscaped = true
+				ret.WriteString(escaped)
+				i++
+				start = i
+			} else {
+				i++
+			}
+		} else {
+			c, size := utf8.DecodeRune([]byte(s[i:]))
+			if c == utf8.RuneError && size == 1 { // refer to codes of `binary.marshalStringTo`
+				if start < i {
+					ret.WriteString(s[start:i])
+				}
+				hasEscaped = true
+				ret.WriteString(`\ufffd`)
+				i += size
+				start = i
+				continue
+			}
+			i += size
+		}
+	}
+
+	if start < len(s) {
+		ret.WriteString(s[start:])
+	}
+
+	if hasEscaped {
+		ret.WriteByte('"')
+		return ret.String()
+	}
+	return ret.String()[1:]
 }
 
 // Extract receives several path expressions as arguments, matches them in bj, and returns:
@@ -296,6 +362,49 @@ func (bj BinaryJSON) Modify(pathExprList []PathExpression, values []BinaryJSON, 
 		case ModifySet:
 			bj = modifier.set(pathExpr, value)
 		}
+	}
+	return bj, nil
+}
+
+// ArrayInsert insert a BinaryJSON into the given array cell.
+// All path expressions cannot contain * or ** wildcard.
+// If any error occurs, the input won't be changed.
+func (bj BinaryJSON) ArrayInsert(pathExpr PathExpression, value BinaryJSON) (res BinaryJSON, err error) {
+	// Check the path is a index
+	if len(pathExpr.legs) < 1 {
+		return bj, ErrInvalidJSONPathArrayCell
+	}
+	parentPath, lastLeg := pathExpr.popOneLastLeg()
+	if lastLeg.typ != pathLegIndex {
+		return bj, ErrInvalidJSONPathArrayCell
+	}
+	// Find the target array
+	obj, exists := bj.Extract([]PathExpression{parentPath})
+	if !exists || obj.TypeCode != TypeCodeArray {
+		return bj, nil
+	}
+
+	idx := lastLeg.arrayIndex
+	count := obj.GetElemCount()
+	if idx >= count {
+		idx = count
+	}
+	// Insert into the array
+	newArray := make([]BinaryJSON, 0, count+1)
+	for i := 0; i < idx; i++ {
+		elem := obj.arrayGetElem(i)
+		newArray = append(newArray, elem)
+	}
+	newArray = append(newArray, value)
+	for i := idx; i < count; i++ {
+		elem := obj.arrayGetElem(i)
+		newArray = append(newArray, elem)
+	}
+	obj = buildBinaryArray(newArray)
+
+	bj, err = bj.Modify([]PathExpression{parentPath}, []BinaryJSON{obj}, ModifySet)
+	if err != nil {
+		return bj, err
 	}
 	return bj, nil
 }
@@ -528,6 +637,41 @@ func compareFloat64PrecisionLoss(x, y float64) int {
 	return 1
 }
 
+func compareInt64(x int64, y int64) int {
+	if x < y {
+		return -1
+	} else if x == y {
+		return 0
+	}
+
+	return 1
+}
+
+func compareUint64(x uint64, y uint64) int {
+	if x < y {
+		return -1
+	} else if x == y {
+		return 0
+	}
+
+	return 1
+}
+
+func compareInt64Uint64(x int64, y uint64) int {
+	if x < 0 {
+		return -1
+	}
+	return compareUint64(uint64(x), y)
+}
+
+func compareFloat64Int64(x float64, y int64) int {
+	return compareFloat64PrecisionLoss(x, float64(y))
+}
+
+func compareFloat64Uint64(x float64, y uint64) int {
+	return compareFloat64PrecisionLoss(x, float64(y))
+}
+
 // CompareBinary compares two binary json objects. Returns -1 if left < right,
 // 0 if left == right, else returns 1.
 func CompareBinary(left, right BinaryJSON) int {
@@ -543,10 +687,33 @@ func CompareBinary(left, right BinaryJSON) int {
 		case TypeCodeLiteral:
 			// false is less than true.
 			cmp = int(right.Value[0]) - int(left.Value[0])
-		case TypeCodeInt64, TypeCodeUint64, TypeCodeFloat64:
-			leftFloat := i64AsFloat64(left.GetInt64(), left.TypeCode)
-			rightFloat := i64AsFloat64(right.GetInt64(), right.TypeCode)
-			cmp = compareFloat64PrecisionLoss(leftFloat, rightFloat)
+		case TypeCodeInt64:
+			switch right.TypeCode {
+			case TypeCodeInt64:
+				cmp = compareInt64(left.GetInt64(), right.GetInt64())
+			case TypeCodeUint64:
+				cmp = compareInt64Uint64(left.GetInt64(), right.GetUint64())
+			case TypeCodeFloat64:
+				cmp = -compareFloat64Int64(right.GetFloat64(), left.GetInt64())
+			}
+		case TypeCodeUint64:
+			switch right.TypeCode {
+			case TypeCodeInt64:
+				cmp = -compareInt64Uint64(right.GetInt64(), left.GetUint64())
+			case TypeCodeUint64:
+				cmp = compareUint64(left.GetUint64(), right.GetUint64())
+			case TypeCodeFloat64:
+				cmp = -compareFloat64Uint64(right.GetFloat64(), left.GetUint64())
+			}
+		case TypeCodeFloat64:
+			switch right.TypeCode {
+			case TypeCodeInt64:
+				cmp = compareFloat64Int64(left.GetFloat64(), right.GetInt64())
+			case TypeCodeUint64:
+				cmp = compareFloat64Uint64(left.GetFloat64(), right.GetUint64())
+			case TypeCodeFloat64:
+				cmp = compareFloat64PrecisionLoss(left.GetFloat64(), right.GetFloat64())
+			}
 		case TypeCodeString:
 			cmp = bytes.Compare(left.GetString(), right.GetString())
 		case TypeCodeArray:
@@ -570,21 +737,6 @@ func CompareBinary(left, right BinaryJSON) int {
 		cmp = precedence1 - precedence2
 	}
 	return cmp
-}
-
-func i64AsFloat64(i64 int64, typeCode TypeCode) float64 {
-	switch typeCode {
-	case TypeCodeLiteral, TypeCodeInt64:
-		return float64(i64)
-	case TypeCodeUint64:
-		u64 := *(*uint64)(unsafe.Pointer(&i64))
-		return float64(u64)
-	case TypeCodeFloat64:
-		return *(*float64)(unsafe.Pointer(&i64))
-	default:
-		msg := fmt.Sprintf(unknownTypeCodeErrorMsg, typeCode)
-		panic(msg)
-	}
 }
 
 // MergeBinary merges multiple BinaryJSON into one according the following rules:
@@ -669,7 +821,7 @@ func PeekBytesAsJSON(b []byte) (n int, err error) {
 		err = errors.New("Cant peek from empty bytes")
 		return
 	}
-	switch c := TypeCode(b[0]); c {
+	switch c := b[0]; c {
 	case TypeCodeObject, TypeCodeArray:
 		if len(b) >= valTypeSize+headerSize {
 			size := endian.Uint32(b[valTypeSize+dataSizeOff:])
@@ -769,4 +921,190 @@ func (bj BinaryJSON) GetElemDepth() int {
 	default:
 		return 1
 	}
+}
+
+// Search for JSON_Search
+// rules referenced by MySQL JSON_SEARCH function
+// [https://dev.mysql.com/doc/refman/5.7/en/json-search-functions.html#function_json-search]
+func (bj BinaryJSON) Search(containType string, search string, escape byte, pathExpres []PathExpression) (res BinaryJSON, isNull bool, err error) {
+	if containType != ContainsPathOne && containType != ContainsPathAll {
+		return res, true, ErrInvalidJSONPath
+	}
+	patChars, patTypes := stringutil.CompilePattern(search, escape)
+
+	result := make([]interface{}, 0)
+	walkFn := func(fullpath PathExpression, bj BinaryJSON) (stop bool, err error) {
+		if bj.TypeCode == TypeCodeString && stringutil.DoMatch(string(bj.GetString()), patChars, patTypes) {
+			result = append(result, fullpath.String())
+			if containType == ContainsPathOne {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	if len(pathExpres) != 0 {
+		err := bj.Walk(walkFn, pathExpres...)
+		if err != nil {
+			return res, true, err
+		}
+	} else {
+		err := bj.Walk(walkFn)
+		if err != nil {
+			return res, true, err
+		}
+	}
+	switch len(result) {
+	case 0:
+		return res, true, nil
+	case 1:
+		return CreateBinary(result[0]), false, nil
+	default:
+		return CreateBinary(result), false, nil
+	}
+
+}
+
+// extractCallbackFn: the type of CALLBACK function for extractToCallback
+type extractCallbackFn func(fullpath PathExpression, bj BinaryJSON) (stop bool, err error)
+
+// extractToCallback: callback alternative of extractTo
+//     would be more effective when walk through the whole JSON is unnecessary
+// NOTICE: path [0] & [*] for JSON object other than array is INVALID, which is different from extractTo.
+func (bj BinaryJSON) extractToCallback(pathExpr PathExpression, callbackFn extractCallbackFn, fullpath PathExpression) (stop bool, err error) {
+	if len(pathExpr.legs) == 0 {
+		return callbackFn(fullpath, bj)
+	}
+
+	currentLeg, subPathExpr := pathExpr.popOneLeg()
+	if currentLeg.typ == pathLegIndex && bj.TypeCode == TypeCodeArray {
+		elemCount := bj.GetElemCount()
+		if currentLeg.arrayIndex == arrayIndexAsterisk {
+			for i := 0; i < elemCount; i++ {
+				//buf = bj.arrayGetElem(i).extractTo(buf, subPathExpr)
+				path := fullpath.pushBackOneIndexLeg(i)
+				stop, err = bj.arrayGetElem(i).extractToCallback(subPathExpr, callbackFn, path)
+				if stop || err != nil {
+					return
+				}
+			}
+		} else if currentLeg.arrayIndex < elemCount {
+			//buf = bj.arrayGetElem(currentLeg.arrayIndex).extractTo(buf, subPathExpr)
+			path := fullpath.pushBackOneIndexLeg(currentLeg.arrayIndex)
+			stop, err = bj.arrayGetElem(currentLeg.arrayIndex).extractToCallback(subPathExpr, callbackFn, path)
+			if stop || err != nil {
+				return
+			}
+		}
+	} else if currentLeg.typ == pathLegKey && bj.TypeCode == TypeCodeObject {
+		elemCount := bj.GetElemCount()
+		if currentLeg.dotKey == "*" {
+			for i := 0; i < elemCount; i++ {
+				//buf = bj.objectGetVal(i).extractTo(buf, subPathExpr)
+				path := fullpath.pushBackOneKeyLeg(string(bj.objectGetKey(i)))
+				stop, err = bj.objectGetVal(i).extractToCallback(subPathExpr, callbackFn, path)
+				if stop || err != nil {
+					return
+				}
+			}
+		} else {
+			child, ok := bj.objectSearchKey(hack.Slice(currentLeg.dotKey))
+			if ok {
+				//buf = child.extractTo(buf, subPathExpr)
+				path := fullpath.pushBackOneKeyLeg(currentLeg.dotKey)
+				stop, err = child.extractToCallback(subPathExpr, callbackFn, path)
+				if stop || err != nil {
+					return
+				}
+			}
+		}
+	} else if currentLeg.typ == pathLegDoubleAsterisk {
+		//buf = bj.extractTo(buf, subPathExpr)
+		stop, err = bj.extractToCallback(subPathExpr, callbackFn, fullpath)
+		if stop || err != nil {
+			return
+		}
+
+		if bj.TypeCode == TypeCodeArray {
+			elemCount := bj.GetElemCount()
+			for i := 0; i < elemCount; i++ {
+				//buf = bj.arrayGetElem(i).extractTo(buf, pathExpr)
+				path := fullpath.pushBackOneIndexLeg(i)
+				stop, err = bj.arrayGetElem(i).extractToCallback(pathExpr, callbackFn, path)
+				if stop || err != nil {
+					return
+				}
+			}
+		} else if bj.TypeCode == TypeCodeObject {
+			elemCount := bj.GetElemCount()
+			for i := 0; i < elemCount; i++ {
+				//buf = bj.objectGetVal(i).extractTo(buf, pathExpr)
+				path := fullpath.pushBackOneKeyLeg(string(bj.objectGetKey(i)))
+				stop, err = bj.objectGetVal(i).extractToCallback(pathExpr, callbackFn, path)
+				if stop || err != nil {
+					return
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+// BinaryJSONWalkFunc is used as callback function for BinaryJSON.Walk
+type BinaryJSONWalkFunc func(fullpath PathExpression, bj BinaryJSON) (stop bool, err error)
+
+// Walk traverse BinaryJSON objects
+func (bj BinaryJSON) Walk(walkFn BinaryJSONWalkFunc, pathExprList ...PathExpression) (err error) {
+	pathSet := make(map[string]bool)
+
+	var doWalk extractCallbackFn
+	doWalk = func(fullpath PathExpression, bj BinaryJSON) (stop bool, err error) {
+		pathStr := fullpath.String()
+		if _, ok := pathSet[pathStr]; ok {
+			return false, nil
+		}
+
+		stop, err = walkFn(fullpath, bj)
+		pathSet[pathStr] = true
+		if stop || err != nil {
+			return
+		}
+
+		if bj.TypeCode == TypeCodeArray {
+			elemCount := bj.GetElemCount()
+			for i := 0; i < elemCount; i++ {
+				path := fullpath.pushBackOneIndexLeg(i)
+				stop, err = doWalk(path, bj.arrayGetElem(i))
+				if stop || err != nil {
+					return
+				}
+			}
+		} else if bj.TypeCode == TypeCodeObject {
+			elemCount := bj.GetElemCount()
+			for i := 0; i < elemCount; i++ {
+				path := fullpath.pushBackOneKeyLeg(string(bj.objectGetKey(i)))
+				stop, err = doWalk(path, bj.objectGetVal(i))
+				if stop || err != nil {
+					return
+				}
+			}
+		}
+		return false, nil
+	}
+
+	fullpath := PathExpression{legs: make([]pathLeg, 0, 32), flags: pathExpressionFlag(0)}
+	if len(pathExprList) > 0 {
+		for _, pathExpr := range pathExprList {
+			var stop bool
+			stop, err = bj.extractToCallback(pathExpr, doWalk, fullpath)
+			if stop || err != nil {
+				return err
+			}
+		}
+	} else {
+		_, err = doWalk(fullpath, bj)
+		if err != nil {
+			return
+		}
+	}
+	return nil
 }
